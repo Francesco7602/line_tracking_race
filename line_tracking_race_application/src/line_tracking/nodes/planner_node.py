@@ -19,6 +19,7 @@ import sys
 # These modules contain the computer vision algorithms for line detection
 from line_tracking.planning_strategies.centroid_strategy import CentroidStrategy
 from line_tracking.planning_strategies.centerline_strategy import CenterlineStrategy
+from line_tracking.planning_strategies.better_centerline_strategy import BetterCenterlineStrategy
 from line_tracking.planning_strategies.error_type import ErrorType
 
 
@@ -106,9 +107,11 @@ class PlannerNode(Node):
             SystemExit: If invalid error type is specified
         """
         if self.error_type_arg == "offset":
+            print("Using offset error")
             # Offset error: lateral distance from line center
             return ErrorType.OFFSET
         elif self.error_type_arg == "angle":
+            print("Using angle error")
             # Angle error: angular deviation from line direction
             return ErrorType.ANGLE
         else:
@@ -137,6 +140,11 @@ class PlannerNode(Node):
         elif self.planning_strategy_arg == "centerline":
             # Centerline strategy: fits a line through detected features
             self.strategy = CenterlineStrategy(error_type, self.viz, self)
+            self.get_logger().info("Using Centerline planning strategy")
+
+        elif self.planning_strategy_arg == "better_centerline":
+            # Centerline strategy: fits a line through detected features
+            self.strategy = BetterCenterlineStrategy(error_type, self.viz, self)
             self.get_logger().info("Using Centerline planning strategy")
             
         else:

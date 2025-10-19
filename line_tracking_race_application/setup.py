@@ -34,6 +34,7 @@ setup(
             'control_node = line_tracking.nodes.control_node:main',
             'referee_node = line_tracking.nodes.referee_node:main',
             'referee_gui_node = line_tracking.nodes.referee_gui_node:main',
+            'better_control_node = line_tracking.nodes.better_control_node:main',
         ],
     },
 )

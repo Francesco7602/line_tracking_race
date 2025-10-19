@@ -11,7 +11,7 @@
           <geometry>
             <plane>
               <normal>0 0 1</normal>
-              <size>10 10</size>
+              <size>20 25</size>
             </plane>
           </geometry>
           <material>
@@ -28,7 +28,7 @@
         <collision name="track_collision">
           <geometry>
             <box>
-              <size>10 10 0.1</size>
+              <size>20 25 0.1</size>
             </box>
           </geometry>
         </collision>

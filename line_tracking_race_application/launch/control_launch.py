@@ -23,7 +23,7 @@ def generate_launch_description():
 
         Node(
             package='line_tracking_race_application',
-            executable='control_node',
+            executable='better_control_node', #prima era control_node
             name='ControlNode',
             namespace='line_tracking',
             parameters=[
