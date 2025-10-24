@@ -21,7 +21,14 @@ class ExplorationBasedStrategy:
 
         # Stato interno
         self.exploration_mode = True
-        self.map_points = []
+        self.map_resolution = 0.05  # metri per pixel (puoi regolare questo valore)
+        self.map_size_meters = 40.0  # 40x40 m di mappa totale (dipende dal tuo scenario)
+        self.map_size_pixels = int(self.map_size_meters / self.map_resolution)
+
+        # Mappa 2D: inizialmente tutta a zero
+        self.map_matrix = np.zeros((self.map_size_pixels, self.map_size_pixels), dtype=np.uint8)
+        self.map_origin_world = (0.0, 0.0)
+        self.map_origin_pixels = (self.map_size_pixels // 2, self.map_size_pixels // 2)
         # --- 🌍 NUOVO: Gestione della posa del veicolo ---
         self.current_pose = None  # (x_odom, y_odom, yaw_odom)
 
@@ -85,12 +92,6 @@ class ExplorationBasedStrategy:
         # --- MODIFICHE PER MAPPA 2D STABILE ---
         if self.should_visualize:
             self.window_name = "Exploration Map"
-            self.map_size_pixels = 800
-            self.map_scale = 50.0  # Pixel per metro
-            self.map_img = np.zeros((self.map_size_pixels, self.map_size_pixels, 3), dtype=np.uint8)
-            self.map_origin_world = None
-            self.map_origin_pixels = (self.map_size_pixels // 2, self.map_size_pixels // 2)
-            self.last_drawn_index = 0
             cv.namedWindow(self.window_name, cv.WINDOW_NORMAL)
             cv.resizeWindow(self.window_name, self.map_size_pixels, self.map_size_pixels)
 
@@ -98,12 +99,30 @@ class ExplorationBasedStrategy:
 
     # --- 🌍 NUOVO: Callback per l'odometria ---
     def _on_odometry_received(self, msg: Odometry):
-        """Aggiorna la posa corrente del veicolo."""
         pos = msg.pose.pose.position
         orient = msg.pose.pose.orientation
         _, _, yaw = euler_from_quaternion(orient.x, orient.y, orient.z, orient.w)
-        self.current_pose = (pos.x, pos.y, yaw)
-        self.node.get_logger().info(f"Pose updated: x={pos.x:.2f}, y={pos.y:.2f}, yaw={math.degrees(yaw):.1f}°")
+
+        new_pose = (pos.x, pos.y, yaw)
+
+        # --- Controllo anti-teletrasporto ---
+        if self.current_pose is not None:
+            old_x, old_y, old_yaw = self.current_pose
+            dist_jump = math.hypot(new_pose[0] - old_x, new_pose[1] - old_y)
+            yaw_jump = abs((new_pose[2] - old_yaw + math.pi) % (2 * math.pi) - math.pi)
+
+            # Soglie da regolare in base al tuo robot / simulator
+            if dist_jump > 1.0 or yaw_jump > math.radians(90):
+                self.node.get_logger().warn(
+                    f"[Odom Filter] Ignorato salto anomalo: Δpos={dist_jump:.2f} m, Δyaw={math.degrees(yaw_jump):.1f}°"
+                )
+                return  # Ignora questo frame
+
+        self.current_pose = new_pose
+        self.node.get_logger().info(
+            f"Pose updated: x={pos.x:.2f}, y={pos.y:.2f}, yaw={math.degrees(yaw):.1f}°"
+        )
+
     # =========================================================
     # MAIN LOOP
     # =========================================================
@@ -218,6 +237,10 @@ class ExplorationBasedStrategy:
 
         # 1. Trova le coordinate dei pixel "gialli" (non-zero)
         # Risultato: array (N, 2) di coordinate (riga=y, colonna=x) nell'immagine
+        # Prima di np.where(track_outline == 255)
+        track_outline = cv.morphologyEx(track_outline, cv.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        track_outline = cv.morphologyEx(track_outline, cv.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+
         row_indices, col_indices = np.where(track_outline == 255)
         yellow_pixel_coords = np.column_stack((row_indices, col_indices))
 
@@ -230,6 +253,10 @@ class ExplorationBasedStrategy:
         points_camera = np.float32(yellow_pixel_coords[:, [1, 0]]).reshape(-1, 1, 2)
         points_vehicle = cv.perspectiveTransform(points_camera, self.M)
         points_vehicle_2d = points_vehicle.squeeze()  # Ora è già in formato (X_avanti, Y_laterale)
+        # Filtro anti-outlier: tiene solo punti entro un range logico
+        valid_mask = (points_vehicle_2d[:, 0] >= 0.0) & (points_vehicle_2d[:, 0] <= 1.0) & \
+                     (np.abs(points_vehicle_2d[:, 1]) <= 1.0)
+        points_vehicle_2d = points_vehicle_2d[valid_mask]
 
         if self.current_pose is None:
             self.node.get_logger().warn("Posa Odom non disponibile.")
@@ -251,11 +278,13 @@ class ExplorationBasedStrategy:
         # =========================================================
         # Converti l'array NumPy di punti (N, 2) in una lista di tuple [(x1, y1), (x2, y2), ...]
         # e aggiungi questi nuovi punti alla lista globale della mappa.
-        sampled_points_odom = points_odom[::5]
+        sampled_points_odom = points_odom[::10]
 
         # ... (il resto del codice) ...
-        new_points_list = [tuple(point) for point in sampled_points_odom]  # Usa sampled_points_odom
-        self.map_points.extend(new_points_list)
+        for (x, y) in sampled_points_odom:
+            px, py = self._world_to_map_coords(x, y)
+            if px is not None and py is not None:
+                self.map_matrix[py, px] = 255  # bianco (tracciato)
 
         # Lancia la visualizzazione della mappa, se abilitata
         if self.should_visualize:
@@ -311,25 +340,39 @@ class ExplorationBasedStrategy:
         return float(curvature)
 
     def _world_to_map_coords(self, world_x, world_y):
-        """Converte coordinate del mondo (es. da centerline) a coordinate pixel sulla mappa."""
         if self.map_origin_world is None:
+            self.node.get_logger().warn("map_origin_world is None!")
             return None, None
 
-        # Calcola lo spostamento dall'origine del mondo
         delta_x = world_x - self.map_origin_world[0]
         delta_y = world_y - self.map_origin_world[1]
 
-        # Applica la scala e aggiungi l'offset del centro dell'immagine
-        # Nota: l'asse Y dell'immagine è invertito (0 è in alto)
-        pixel_x = self.map_origin_pixels[0] + int(delta_x * self.map_scale)
-        pixel_y = self.map_origin_pixels[1] - int(delta_y * self.map_scale)
+        pixel_x = int(self.map_origin_pixels[0] + delta_x / self.map_resolution)
+        pixel_y = int(self.map_origin_pixels[1] - delta_y / self.map_resolution)
 
-        return pixel_x, pixel_y
+        if 0 <= pixel_x < self.map_size_pixels and 0 <= pixel_y < self.map_size_pixels:
+            return pixel_x, pixel_y
+        else:
+            return None, None
 
     # =========================================================
     # VISUALIZZAZIONE MAPPA
     # =========================================================
+
     def _visualize_map(self):
+        display_img = cv.cvtColor(self.map_matrix, cv.COLOR_GRAY2BGR)
+
+        # Disegna il robot
+        if self.current_pose is not None:
+            x_odom, y_odom, yaw_odom = self.current_pose
+            lx, ly = self._world_to_map_coords(x_odom, y_odom)
+            if lx is not None:
+                cv.circle(display_img, (lx, ly), 3, (0, 0, 255), -1)
+
+        cv.imshow("Exploration Map", display_img)
+        cv.waitKey(1)
+
+    def _visualize_map2(self):
         if not self.map_points:
             return
 
