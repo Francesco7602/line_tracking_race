@@ -20,6 +20,7 @@ import sys
 from line_tracking.planning_strategies.centroid_strategy import CentroidStrategy
 from line_tracking.planning_strategies.centerline_strategy import CenterlineStrategy
 from line_tracking.planning_strategies.better_centerline_strategy import BetterCenterlineStrategy
+from line_tracking.planning_strategies.exploration_based_strategy import ExplorationBasedStrategy
 from line_tracking.planning_strategies.error_type import ErrorType
 
 
@@ -145,7 +146,11 @@ class PlannerNode(Node):
         elif self.planning_strategy_arg == "better_centerline":
             # Centerline strategy: fits a line through detected features
             self.strategy = BetterCenterlineStrategy(error_type, self.viz, self)
-            self.get_logger().info("Using Centerline planning strategy")
+            self.get_logger().info("Using BetterCenterline planning strategy")
+        elif self.planning_strategy_arg == "exploration_based":
+            # Centerline strategy: fits a line through detected features
+            self.strategy = ExplorationBasedStrategy(error_type,True, self)
+            self.get_logger().info("Using exploration_based planning strategy")
             
         else:
             # Invalid strategy - log error and shutdown

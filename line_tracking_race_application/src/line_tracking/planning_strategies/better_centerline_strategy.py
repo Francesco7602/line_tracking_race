@@ -73,6 +73,12 @@ class BetterCenterlineStrategy:
         # Initialize fallback values for when track detection fails
         self.prev_offset = 0
         self.prev_waypoint = (0, 0)
+        # Numero di cicli per cui mantenere il valore fisso (es. 20 cicli)
+        self.hold_cycles = 20
+        # Contatore dei cicli rimanenti in "modalità hold"
+        self.cycles_to_hold = 0
+        # Valore di curvatura da mantenere
+        self.held_curvature = 0.0
         self.curvature_publisher = node.create_publisher(Float32, '/planning/curvature', 10)
 
     def plan(self, img_msg):
@@ -99,11 +105,11 @@ class BetterCenterlineStrategy:
         # Extract track outline from the image
         track_outline = self.get_track_outline(image)
 
-        # Crop image to focus on relevant area and remove border artifacts
+        # Crop image to focus on relevant area and remove  border artifacts
         # - Remove top half to focus on nearby track sections
         # - Remove 100 pixels from left/right borders to eliminate edge artifacts
         cropped_outline = track_outline[
-            : (height - 10),  # Vertical crop: middle to bottom-10
+            : (height),  # Vertical crop: top to bottom-10
             50 : (width - 50)              # Horizontal crop: remove 100px borders
         ]
         cr_height, cr_width = cropped_outline.shape
@@ -117,14 +123,37 @@ class BetterCenterlineStrategy:
 
 
         # Calcola la curvatura
-        curvature = self.calculate_curvature(centerline)
+        #curvature = self.calculate_curvature(centerline)
+        current_curvature= self.calculate_point_ratio_curvature(left_limit, right_limit)
+        CURVATURE_THRESHOLD = 0.10  # Soglia di importanza
+
+        if self.cycles_to_hold > 0:
+            # Modalità HOLD: Manteniamo il valore precedente
+            curvature_to_publish = self.held_curvature
+            self.cycles_to_hold -= 1
+
+            # Se siamo vicini alla fine del blocco, controlliamo se la curva persiste
+            if self.cycles_to_hold < 3 and abs(current_curvature) > CURVATURE_THRESHOLD:
+                # Se la curva è ancora forte, resettiamo il timer
+                self.cycles_to_hold = self.hold_cycles
+
+        elif abs(current_curvature) >= CURVATURE_THRESHOLD:
+            # Modalità START HOLD: Trovata una curva forte
+            # Inizializza il timer e memorizza il valore.
+            self.cycles_to_hold = self.hold_cycles
+            self.held_curvature = current_curvature
+            curvature_to_publish = current_curvature
+
+        else:
+            # Modalità NORMALE: Usa il valore calcolato
+            curvature_to_publish = current_curvature
+        curvature = curvature_to_publish
         # Pubblica la curvatura
         curvature_msg = Float32()
         curvature_msg.data = float(curvature)
         self.curvature_publisher.publish(curvature_msg)
         
-        self.node.get_logger().info(f"Curva rilevata! Curvatura: {curvature:.2f}")
-        
+
         # Debug visualization
         if self.viz is not None:
             debug_img = cv.cvtColor(cropped_outline, cv.COLOR_GRAY2BGR)
@@ -135,8 +164,8 @@ class BetterCenterlineStrategy:
                     pt1 = tuple(map(int, centerline[i]))
                     pt2 = tuple(map(int, centerline[i + 1]))
                     cv.line(debug_img, pt1, pt2, color, 2)
-            cv.imshow("Curvature Debug", debug_img)
-            cv.waitKey(1)
+            #cv.imshow("Curvature Debug", debug_img)
+            #cv.waitKey(1)
 
         # Converti l'immagine in scala di grigi in RGB per visualizzazione
         vis_img = cv.cvtColor(cropped_outline, cv.COLOR_GRAY2BGR)
@@ -159,8 +188,8 @@ class BetterCenterlineStrategy:
                 cv.circle(vis_img, (x, y), radius=2, color=(255, 255, 255), thickness=-1)  # BGR bianco
 
         # Mostra tutto in un'unica finestra
-        cv.imshow("Track + Borders + Centerline", vis_img)
-        cv.waitKey(1)
+        #cv.imshow("Track + Borders + Centerline", vis_img)
+        #cv.waitKey(1)
 
         # Define reference points for navigation
         crosshair = (math.floor(cr_width / 2), math.floor(cr_height / 2))  # Screen center
@@ -230,7 +259,7 @@ class BetterCenterlineStrategy:
         mask = cv.inRange(hsv, np.array(LOWER_YELLOW), np.array(UPPER_YELLOW))
 
         # Morphological cleaning to remove noise
-        kernel = np.ones((5, 5), np.uint8)
+        kernel = np.ones((3, 3), np.uint8)
         mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel)
         mask = cv.morphologyEx(mask, cv.MORPH_OPEN, kernel)
 
@@ -242,7 +271,8 @@ class BetterCenterlineStrategy:
 
         if contours:
             largest_contour = max(contours, key=cv.contourArea)
-            cv.drawContours(track_outline, [largest_contour], -1, 255, thickness=2)  # White contour
+            cv.drawContours(track_outline, [largest_contour], -1, 255, thickness=-1)  # Fill
+            #cv.drawContours(track_outline, [largest_contour], -1, 255, thickness=2)  # White contour
 
 
 
@@ -250,88 +280,74 @@ class BetterCenterlineStrategy:
 
     def extract_track_limits(self, track_outline):
         """
-        Extract left and right track boundaries from the track outline image.
-
-        If the boundaries are connected (fused), this method treats the largest
-        component as the entire track and splits it based on the X-coordinate median.
+        Extract left and right track boundaries from the track outline image
+        without fusing them.
 
         Args:
-            track_outline (np.ndarray): Binary image containing track outline
+            track_outline (np.ndarray): Binary image of track (0=background, 255=track)
 
         Returns:
-            tuple: (left_limit, right_limit) - Two numpy arrays containing
-                   coordinates of left and right track boundaries respectively
+            tuple: (left_limit, right_limit) as two numpy arrays of (X,Y) coordinates
         """
-        _, labels = cv.connectedComponents(track_outline)
-        num_labels = labels.max()
-
-        # 1. Trova l'etichetta della componente più grande (la pista)
-        max_area = 0
-        track_label = -1
-        for label in range(1, num_labels + 1):
-            area = np.sum(labels == label)
-            if area > max_area:
-                max_area = area
-                track_label = label
-
-        if track_label == -1:
-            # Nessuna componente trovata
+        # Trova tutti i contorni esterni
+        contours, _ = cv.findContours(track_outline, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE)
+        if not contours:
             return np.array([]), np.array([])
 
-        # 2. Estrai tutti i punti della componente più grande
-        rows, cols = np.where(labels == track_label)
-        all_points = np.column_stack((cols, rows))  # (X, Y)
+        # Crea liste vuote per sinistra e destra
+        left_limit = []
+        right_limit = []
 
-        # 3. Dividi i punti in Left e Right in base alla mediana X
-        # Questo funziona bene se la pista è grossomodo centrata.
+        # Itera su ogni riga dell'immagine
+        height, width = track_outline.shape
+        for y in range(height):
+            # Trova tutti i punti della riga y che fanno parte della pista
+            x_points = np.where(track_outline[y, :] > 0)[0]
+            if len(x_points) == 0:
+                continue
 
-        # Trova il valore mediano della coordinata X di tutti i punti
-        median_x = np.median(all_points[:, 0])
+            left_limit.append([x_points[0], y])  # primo punto a sinistra
+            right_limit.append([x_points[-1], y])  # ultimo punto a destra
 
-        # Punti del lato sinistro (X < mediana)
-        left_mask = all_points[:, 0] < median_x
-        left_limit = all_points[left_mask]
+        left_limit = np.array(left_limit)
+        right_limit = np.array(right_limit)
 
-        # Punti del lato destro (X >= mediana)
-        right_mask = all_points[:, 0] >= median_x
-        right_limit = all_points[right_mask]
+        # Subsampling per velocizzare calcoli successivi
+        left_limit = left_limit[::2]
+        right_limit = right_limit[::2]
 
-        # 4. Applica il subsampling a entrambi i limiti
-        left_limit = left_limit[::10]
-        right_limit = right_limit[::10]
-
-        # Verifica se i limiti sono validi
-        if left_limit.size < 50 or right_limit.size < 50:  # Controllo per rumore minimo
+        # Controllo dimensione minima
+        if left_limit.size < 10 or right_limit.size < 10:
             return np.array([]), np.array([])
 
         return left_limit, right_limit
 
     def compute_centerline(self, left, right):
         if left.size == 0 or right.size == 0:
+            self.node.get_logger().info("No track limits found, can't compute centerline.")
             return np.array([])
 
-        # I punti in 'left' e 'right' sono già unici per Y (dalla modifica precedente)
-        # Li ordiniamo solo per sicurezza.
-        left = left[left[:, 1].argsort()]
+        left = left[left[:, 1].argsort()] #Ordina entrambi gli array per la coordinata Y in ordine crescente
         right = right[right[:, 1].argsort()]
 
-        y_vals = left[:, 1]
+
+        y_vals = left[:, 1] #Estrae il vettore delle coordinate Y dei punti del lato sinistro
 
         # Interpolazione solo se ci sono abbastanza punti nel 'right'
-        if right.shape[0] < 2:
+        if right.shape[0] < 2: #se il lato destro ha meno di 2 punti, non è possibile interpolare
             return np.array([])
 
         # Interpoliamo l'X del bordo destro in base agli Y del bordo sinistro.
-        right_interp_x = np.interp(y_vals, right[:, 1], right[:, 0])
+        right_interp_x = np.interp(y_vals, right[:, 1], right[:, 0])  #un vettore con la X stimata del bordo destro per ciascun Y presente in left
 
-        lane_width = np.abs(left[:, 0] - right_interp_x)
+        lane_width = np.abs(left[:, 0] - right_interp_x) #Calcola la larghezza della corsia lane_width per ciascun Y come valore assoluto della differenza tra la X sinistra e la X destra interpolata. Risultato è un vettore (n,).
 
         # 2. Definizione delle soglie (aggiungi anche la massima)
         MIN_LANE_WIDTH = 10
-        MAX_LANE_WIDTH = 150  # Usa un valore massimo adeguato al tuo cropping
+        MAX_LANE_WIDTH = 100  # Usa un valore massimo adeguato al tuo cropping
 
         # 3. Filtra: rimuovi i punti dove la larghezza è troppo stretta O TROPPO LARGA
-        valid_indices = (lane_width > MIN_LANE_WIDTH) & (lane_width < MAX_LANE_WIDTH)
+        valid_indices = (lane_width > MIN_LANE_WIDTH) #& (lane_width < MAX_LANE_WIDTH)
 
         # Applica il filtro
         valid_y_vals = y_vals[valid_indices]
@@ -451,59 +467,43 @@ class BetterCenterlineStrategy:
 
         return normalized_error, angle_deg
 
-    def calculate_curvature(self, centerline, window_size=15):  # Usiamo 15 punti per robustezza
 
-        if len(centerline) < 3:
-            return 0.0
+    def calculate_point_ratio_curvature(self, left_limit, right_limit):
+        """
+        Calcola la curvatura basandosi sul rapporto del conteggio dei punti sui limiti della pista.
+        """
+        left_count = len(left_limit)
+        right_count = len(right_limit)
 
-        centerline_window = centerline[:max(3, window_size)]
-        step = 2
-        points = centerline_window[::step]
+        if left_count == 0 or right_count == 0:
+            return 0.0 # Linea dritta / non rilevata
 
-        if len(points) < 3:
-            return 0.0
+        # Calcola il rapporto di sbilanciamento (Ratio)
+        # L'indice va da 0.0 (tutti a destra) a 1.0 (tutti a sinistra), 0.5 (uguali)
+        total_count = left_count + right_count
+        ratio = left_count / total_count
 
-        max_y_in_window = np.max(points[:, 1]) if points.size > 0 else 1
+        # Calcola l'entità della deviazione da 0.5 (perfettamente dritto)
+        # L'output è un valore assoluto da 0 (dritto) a 0.5 (massima curva)
+        # Es: 0.5 - 0.7 = -0.2; abs = 0.2
+        # Es: 0.5 - 0.3 = 0.2; abs = 0.2
+        deviation = abs(ratio - 0.5)
 
-        # CALCOLO DEGLI ANGOLI E PESATURA (PIÙ CAUTA)
-        weighted_angles = []
+        # --- Calibrazione (Adatta questi valori al tuo ambiente!) ---
+        # Normalizza la deviazione per ottenere un valore di 'curvature' tra 0.0 e 1.0
+        # Dove MAX_DEVIATION_FOR_CURVE è la massima deviazione attesa in una curva stretta.
+        MAX_DEVIATION_FOR_CURVE = 0.05  # Ad esempio, una curva stretta ha 65% / 35% di punti.
 
-        for i in range(len(points) - 2):
-            # ... (calcolo di angle in radianti come prima) ...
-            # (omesso per brevità, ma non toccato)
-            p1 = points[i]
-            p2 = points[i + 1]
-            p3 = points[i + 2]
-            v1 = p2 - p1
-            v2 = p3 - p2
-            if np.linalg.norm(v1) > 1e-6 and np.linalg.norm(v2) > 1e-6:
-                v1_unit = v1 / np.linalg.norm(v1)
-                v2_unit = v2 / np.linalg.norm(v2)
-                dot_product = np.clip(np.dot(v1_unit, v2_unit), -1.0, 1.0)
-                angle = np.abs(np.arccos(dot_product))
 
-                y_norm = p2[1] / max_y_in_window
+        curvature_magnitude = min(1.0, deviation / MAX_DEVIATION_FOR_CURVE)
 
-                # Peso lineare (Y alto = lontano = peso basso)
-                weight = (1.0 - y_norm)
+        # Determina la direzione della curva (+1 per sinistra, -1 per destra)
+        # Se ratio > 0.5, ci sono più punti a sinistra (curva a destra)
+        # Se ratio < 0.5, ci sono più punti a destra (curva a sinistra)
+        direction = -1.0 if ratio > 0.5 else 1.0 # Convenzione: +1 = curva a sinistra, -1 = curva a destra
 
-                # --- MODIFICA CRUCIALE 1: Riduzione del fattore di scala ---
-                weight_factor = 5.0  # Ridotto da 10.0 per limitare l'amplificazione del rumore
+        # Il valore finale è la magnitudo * la direzione.
+        # Questo ti fornisce un'indicazione sia della forza che della direzione.
+        final_curvature = curvature_magnitude * direction
 
-                weighted_angles.append(angle * weight * weight_factor)
-
-        if not weighted_angles:
-            return 0.0
-
-        # --- MODIFICA CRUCIALE 2: Uso della media (più stabile) ---
-        significant_weighted_angle = np.mean(weighted_angles)
-
-        angle_deg = np.degrees(significant_weighted_angle)
-
-        # Normalizzazione con soglia più cauta
-        curvature = angle_deg / 30.0
-
-        if curvature < 0.05:
-            return 0.0
-        else:
-            return min(curvature, 1.0)
+        return final_curvature

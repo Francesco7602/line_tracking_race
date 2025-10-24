@@ -18,7 +18,7 @@ from geometry_msgs.msg import Twist
 from ament_index_python.packages import get_package_share_directory
 
 # Control constants
-MAX_THRUST = 2.83   # Maximum forward velocity (m/s)
+MAX_THRUST = 3.0 #2.83   # Maximum forward velocity (m/s) anche diminuendo l-errore non sis tabilizza ahaha
 RAMP_UP = 0.5         # Thrust increment per control cycle for smooth acceleration
 
 class BetterControlNode(Node):
@@ -67,12 +67,13 @@ class BetterControlNode(Node):
         self.get_logger().info("Control node initialized successfully!")
         self.current_curvature = 0.0
 
+
     def _declare_parameters(self):
         """Declare ROS2 parameters with default values."""
         self.declare_parameter("duration", -1.0)  # -1 means no time limit
-        self.declare_parameter("k_p", 0.065)       # Proportional gain
-        self.declare_parameter("k_i", 0.0004)       # Integral gain
-        self.declare_parameter("k_d", 0.018)       # Derivative gain
+        self.declare_parameter("k_p", 4.8)       # Proportional gain  4.8 for 3
+        self.declare_parameter("k_i", 0.01)       # Integral gain 0.01 for 3
+        self.declare_parameter("k_d", 0.4)       # Derivative gain 0.4 for 3
 
     def _get_parameters(self):
         """Retrieve parameter values from ROS2 parameter server."""
@@ -157,6 +158,7 @@ class BetterControlNode(Node):
         elapsed = (time_now - self.time_start).nanoseconds / 1e9
         dt = (time_now - self.time_prev).nanoseconds / 1e9
 
+
         # Check for duration timeout (if specified)
         if self.max_duration >= 0.0 and elapsed > self.max_duration:
             self.get_logger().warn("Maximum duration reached. Stopping robot.")
@@ -179,6 +181,15 @@ class BetterControlNode(Node):
 
         # Apply smooth thrust ramp-up for gentle acceleration
         self._update_thrust()
+        # Normalizza l'output del PID rispetto alla MAX_THRUST
+        # Questo riduce il comando di sterzata (control_output) quando il robot rallenta (thrust < MAX_THRUST)
+        # scaling dinmaico del comando di sterzata
+        #scaling_factor = self.thrust / MAX_THRUST
+        #scaled_angular_z = control_output * scaling_factor
+
+        # Generate velocity commands
+        #linear_x = self.thrust  # Forward velocity
+        #angular_z = scaled_angular_z  # Angular velocity (steering)
 
         # Generate velocity commands
         linear_x = self.thrust      # Forward velocity
@@ -233,8 +244,8 @@ class BetterControlNode(Node):
         curvature = min(max(self.current_curvature, 0.0), 1.0)
         
         # Usa una funzione lineare più conservativa per il fattore di velocità
-        # Mantiene almeno il 50% della velocità massima anche nelle curve più strette
-        speed_factor = 1.0 - (curvature * 0.5)  # Riduce al massimo del 50%
+        # Mantiene almeno il 30% della velocità massima anche nelle curve più strette
+        speed_factor = 1.0 - (curvature * 5)
         
         # Calcola la velocità target
         target_thrust = MAX_THRUST * speed_factor
@@ -242,7 +253,6 @@ class BetterControlNode(Node):
         # Debug log
         self.get_logger().info(f"Curvature: {curvature:.2f}, Speed Factor: {speed_factor:.2f}, Target: {target_thrust:.2f}")
         
-        # Applica accelerazione/decelerazione graduale
         if self.thrust < target_thrust:
             self.thrust += RAMP_UP
             if self.thrust > target_thrust:

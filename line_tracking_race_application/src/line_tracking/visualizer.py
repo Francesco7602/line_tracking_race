@@ -34,7 +34,8 @@ class Visualizer:
             cv.circle(self.canvas, point, 1, colors.YELLOW, 1)
 
         for point in centerline:
-            cv.circle(self.canvas, point, 1, colors.MAGENTA, 1)
+            cv.circle(self.canvas, (int(point[0]), int(point[1])), 1, colors.MAGENTA, 1)
+            #cv.circle(self.canvas, point, 1, colors.MAGENTA, 1)
 
     # Build the background by just using the provided image
     #
@@ -99,6 +100,11 @@ class Visualizer:
 
         height, width, _ = self.canvas.shape
         crosshair = (math.floor(width / 2), math.floor(height / 2))
+
+        # Cast tutti i punti a interi
+        position = (int(position[0]), int(position[1]))
+        waypoint = (int(waypoint[0]), int(waypoint[1]))
+        crosshair = (int(crosshair[0]), int(crosshair[1]))
 
         # Segment connecting the crosshair and the waypoint
         cv.line(
