@@ -66,6 +66,8 @@ class BetterControlNode(Node):
 
         self.get_logger().info("Control node initialized successfully!")
         self.current_curvature = 0.0
+        self.target_velocity = None
+        self.target_angular = None
 
 
     def _declare_parameters(self):
@@ -119,11 +121,16 @@ class BetterControlNode(Node):
             self.handle_error_callback,
             10
         )
-        # Aggiungi subscriber per la curvatura
         self.curvature_sub = self.create_subscription(
             Float32,
             "/planning/curvature",
             self.handle_curvature_callback,
+            10
+        )
+        self.velocity_sub = self.create_subscription(
+            Float32,
+            "/planning/velocity",
+            self.handle_velocity_callback,
             10
         )
 
@@ -142,65 +149,62 @@ class BetterControlNode(Node):
         Args:
             msg (Float32): ROS2 message containing the tracking error
         """
-        error = msg.data
-        self.errors.append(error)
-        time_now = self.get_clock().now()
-        self.times.append(time_now.nanoseconds / 1e9)
+        if self.target_velocity is not None:# and self.target_angular is not None:
+            linear_x = self.target_velocity
+            angular_z = self.target_velocity * self.current_curvature
+            self.get_logger().info(
+                f"Using planned velocity: {linear_x:.2f} m/s, angular: {angular_z:.2f} rad/s, curvature: {self.current_curvature:.2f}")
+        else:
+            error = msg.data
+            self.errors.append(error)
+            time_now = self.get_clock().now()
+            self.times.append(time_now.nanoseconds / 1e9)
 
-        # Initialize timing on first callback
-        if not self.started:
-            self.time_start = time_now
+            # Initialize timing on first callback
+            if not self.started:
+                self.time_start = time_now
+                self.time_prev = time_now
+                self.started = True
+                return
+
+            # Calculate elapsed time and time delta
+            elapsed = (time_now - self.time_start).nanoseconds / 1e9
+            dt = (time_now - self.time_prev).nanoseconds / 1e9
+
+
+            # Check for duration timeout (if specified)
+            if self.max_duration >= 0.0 and elapsed > self.max_duration:
+                self.get_logger().warn("Maximum duration reached. Stopping robot.")
+                self.stop()
+                return
+
+            # Skip control update if time delta is invalid
+            if dt <= 0.0:
+                return
+
+            # Update performance metrics
+            self._update_performance_metrics(error, dt)
+
+            # Calculate PID control output
+            control_output = self._calculate_pid_control(error, dt)
+
+            # Update state variables for next iteration
+            self.prev_error = error
             self.time_prev = time_now
-            self.started = True
-            return
 
-        # Calculate elapsed time and time delta
-        elapsed = (time_now - self.time_start).nanoseconds / 1e9
-        dt = (time_now - self.time_prev).nanoseconds / 1e9
-
-
-        # Check for duration timeout (if specified)
-        if self.max_duration >= 0.0 and elapsed > self.max_duration:
-            self.get_logger().warn("Maximum duration reached. Stopping robot.")
-            self.stop()
-            return
-
-        # Skip control update if time delta is invalid
-        if dt <= 0.0:
-            return
-
-        # Update performance metrics
-        self._update_performance_metrics(error, dt)
-
-        # Calculate PID control output
-        control_output = self._calculate_pid_control(error, dt)
-
-        # Update state variables for next iteration
-        self.prev_error = error
-        self.time_prev = time_now
-
-        # Apply smooth thrust ramp-up for gentle acceleration
-        self._update_thrust()
-        # Normalizza l'output del PID rispetto alla MAX_THRUST
-        # Questo riduce il comando di sterzata (control_output) quando il robot rallenta (thrust < MAX_THRUST)
-        # scaling dinmaico del comando di sterzata
-        #scaling_factor = self.thrust / MAX_THRUST
-        #scaled_angular_z = control_output * scaling_factor
-
-        # Generate velocity commands
-        #linear_x = self.thrust  # Forward velocity
-        #angular_z = scaled_angular_z  # Angular velocity (steering)
-
-        # Generate velocity commands
-        linear_x = self.thrust      # Forward velocity
-        angular_z = control_output  # Angular velocity (steering)
-
-        # Log data and publish commands
-        self.log_data(elapsed, dt, error, control_output, linear_x, angular_z,
-                     self.k_p * error,
-                     self.k_i * self.accumulated_integral,
-                     self.k_d * (error - self.prev_error) / dt)
+            # Apply smooth thrust ramp-up for gentle acceleration
+            self._update_thrust()
+            linear_x = self.thrust      # Forward velocity
+            angular_z = control_output  # Angular velocity (steering)
         self.publish_cmd_vel(linear_x, angular_z)
+
+    def handle_velocity_callback(self, msg):
+        """
+        Handle incoming velocity messages from the planning node.
+        This message sets the desired forward velocity (m/s).
+        """
+        self.target_velocity = msg.data
+        self.get_logger().info(f"Received target velocity: {self.target_velocity:.2f} m/s")
 
     def _update_performance_metrics(self, error, dt):
         """
@@ -240,27 +244,21 @@ class BetterControlNode(Node):
 
     def _update_thrust(self):
         """Apply smooth thrust ramp-up with curvature-based speed control."""
-        # Limita la curvatura tra 0 e 1
-        curvature = min(max(self.current_curvature, 0.0), 1.0)
-        
-        # Usa una funzione lineare più conservativa per il fattore di velocità
-        # Mantiene almeno il 30% della velocità massima anche nelle curve più strette
-        speed_factor = 1.0 - (curvature * 5)
-        
-        # Calcola la velocità target
-        target_thrust = MAX_THRUST * speed_factor
-        
-        # Debug log
-        self.get_logger().info(f"Curvature: {curvature:.2f}, Speed Factor: {speed_factor:.2f}, Target: {target_thrust:.2f}")
-        
-        if self.thrust < target_thrust:
-            self.thrust += RAMP_UP
-            if self.thrust > target_thrust:
-                self.thrust = target_thrust
-        elif self.thrust > target_thrust:
-            self.thrust -= RAMP_UP
+        if self.target_velocity is not None:
+            self.thrust = self.target_velocity
+        else:
+            curvature = min(max(self.current_curvature, 0.0), 1.0)
+            speed_factor = 1.0 - (curvature * 5)
+            target_thrust = MAX_THRUST * speed_factor
+            self.get_logger().info(f"Curvature: {curvature:.2f}, Speed Factor: {speed_factor:.2f}, Target: {target_thrust:.2f}")
             if self.thrust < target_thrust:
-                self.thrust = target_thrust
+                self.thrust += RAMP_UP
+                if self.thrust > target_thrust:
+                    self.thrust = target_thrust
+            elif self.thrust > target_thrust:
+                self.thrust -= RAMP_UP
+                if self.thrust < target_thrust:
+                    self.thrust = target_thrust
 
     def publish_cmd_vel(self, linear_x, angular_z):
         """

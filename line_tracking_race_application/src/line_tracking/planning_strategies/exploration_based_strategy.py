@@ -3,296 +3,255 @@ import math
 import cv2 as cv
 from std_msgs.msg import Float32
 from line_tracking.planning_strategies.better_centerline_strategy import BetterCenterlineStrategy
-from nav_msgs.msg import Odometry # Assicurati di importare Odometry
+from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Quaternion
-# Funzione helper per convertire quaternioni in angoli di Eulero (per ottenere lo yaw)
+from skimage.morphology import skeletonize
+
+# Helper function to convert quaternions into Euler angles (to extract yaw)
 def euler_from_quaternion(x, y, z, w):
-    """Calcola gli angoli di roll, pitch, yaw da un quaternione."""
-    # Semplice implementazione per yaw (pitch e roll ignorati)
+    """Computes roll, pitch, and yaw angles from a quaternion."""
+    # Simple implementation for yaw (pitch and roll are ignored)
     t3 = 2.0 * (w * z + x * y)
     t4 = 1.0 - 2.0 * (y * y + z * z)
     yaw = math.atan2(t3, t4)
     return 0.0, 0.0, yaw
+
 class ExplorationBasedStrategy:
     def __init__(self, error_type, should_visualize, node):
         self.node = node
         self.should_visualize = should_visualize
         self.centerline_strategy = BetterCenterlineStrategy(error_type, should_visualize, node)
 
-        # Stato interno
         self.exploration_mode = True
-        self.map_resolution = 0.05  # metri per pixel (puoi regolare questo valore)
-        self.map_size_meters = 40.0  # 40x40 m di mappa totale (dipende dal tuo scenario)
+        self.map_resolution = 0.02  # meters per pixel
+        self.map_size_meters = 50.0  # 50x50 m total map area
         self.map_size_pixels = int(self.map_size_meters / self.map_resolution)
 
-        # Mappa 2D: inizialmente tutta a zero
+        # 2D map: initially all zeros
         self.map_matrix = np.zeros((self.map_size_pixels, self.map_size_pixels), dtype=np.uint8)
         self.map_origin_world = (0.0, 0.0)
         self.map_origin_pixels = (self.map_size_pixels // 2, self.map_size_pixels // 2)
-        # --- 🌍 NUOVO: Gestione della posa del veicolo ---
         self.current_pose = None  # (x_odom, y_odom, yaw_odom)
 
-        # ----------------------------------------------------------------------
-        # 1. PARAMETRI DI CALIBRAZIONE PROSPETTICA (DEVI AGGIORNARE QUESTI)
-        # ----------------------------------------------------------------------
-
-        # Punti sorgente nell'immagine (rimangono uguali)
         source_points = np.float32([
-            [290, 300],  # A: Alto a sinistra
-            [350, 300],  # B: Alto a destra
-            [440, 480],  # C: Basso a destra
-            [200, 480]  # D: Basso a sinistra
+            [290, 300],  # A: Top left
+            [350, 300],  # B: Top right
+            [440, 480],  # C: Bottom right
+            [200, 480]  # D: Bottom left
         ])
 
-        # NUOVI punti di destinazione in un sistema di coordinate standard
-        # (+X avanti, +Y a sinistra)
+        # (+X forward, +Y left)
         destination_points_standard = np.float32([
-            # [X_avanti, Y_laterale]
-            [3.0, 0.5],  # A: 3m avanti, 0.5m a sinistra
-            [3.0, -0.5],  # B: 3m avanti, 0.5m a destra (-Y)
-            [0.0, -0.5],  # C: 0m avanti, 0.5m a destra (-Y)
-            [0.0, 0.5]  # D: 0m avanti, 0.5m a sinistra
+            [3.0, 0.5],  # A: 3m forward, 0.5m left
+            [3.0, -0.5],  # B: 3m forward, 0.5m right (-Y)
+            [0.0, -0.5],  # C: 0m forward, 0.5m right (-Y)
+            [0.0, 0.5]  # D: 0m forward, 0.5m left
         ])
-
-        # Calcola la nuova Matrice di Trasformazione
+        # Compute the new Transformation Matrix
         self.M = cv.getPerspectiveTransform(source_points, destination_points_standard)
-
-        # ----------------------------------------------------------------------
         self.odom_subscriber = node.create_subscription(
             Odometry,
-            '/car/odom',  # Assicurati che questo topic sia corretto!
+            '/car/odom',
             self._on_odometry_received,
             10
         )
-        # Questo è FONDAMENTALE. Devi dire quanti metri reali corrisponde un "passo"
-        # nel tuo array centerline. Inizia con 1.0 e aggiusta.
-        # Se la mappa è troppo "grande", diminuisci il valore. Se è troppo "piccola", aumentalo.
-        self.pixel_to_meter_scale = 0.05
-
         self.curvature_profile = []
-
-        # Parametri di mappa
         self.loop_threshold = 30.0
         self.coverage_threshold = 2000
-
-        # Parametri di sfruttamento
         self.curvature_gain = 0.5
-        self.lookahead_distance = 50
-
-        # Numero di cicli per cui mantenere il valore fisso
-        self.hold_cycles = 20
+        self.lookahead_distance = 500
+        self.loop_counter = 0
+        self.total_travelled = 0
         self.hold_cycles = 20
         self.cycles_to_hold = 0
         self.held_curvature = 0.0
-
-        # Publisher ROS
         self.mode_publisher = node.create_publisher(Float32, '/planner/mode', 10)
         self.curvature_publisher = node.create_publisher(Float32, '/planning/curvature', 10)
-
-        # --- MODIFICHE PER MAPPA 2D STABILE ---
         if self.should_visualize:
             self.window_name = "Exploration Map"
             cv.namedWindow(self.window_name, cv.WINDOW_NORMAL)
             cv.resizeWindow(self.window_name, self.map_size_pixels, self.map_size_pixels)
 
-        self.node.get_logger().info("[ExplorationBasedStrategy] Avviata in modalità EXPLORATION.")
+        self.node.get_logger().info("[ExplorationBasedStrategy] Started in EXPLORATION mode.")
 
-    # --- 🌍 NUOVO: Callback per l'odometria ---
     def _on_odometry_received(self, msg: Odometry):
         pos = msg.pose.pose.position
         orient = msg.pose.pose.orientation
         _, _, yaw = euler_from_quaternion(orient.x, orient.y, orient.z, orient.w)
-
         new_pose = (pos.x, pos.y, yaw)
-
-        # --- Controllo anti-teletrasporto ---
+        # --- Anti-teleportation check ---
         if self.current_pose is not None:
             old_x, old_y, old_yaw = self.current_pose
             dist_jump = math.hypot(new_pose[0] - old_x, new_pose[1] - old_y)
             yaw_jump = abs((new_pose[2] - old_yaw + math.pi) % (2 * math.pi) - math.pi)
 
-            # Soglie da regolare in base al tuo robot / simulator
-            if dist_jump > 1.0 or yaw_jump > math.radians(90):
+            max_dist = 2.0 if not self.exploration_mode else 0.5
+            max_yaw = math.radians(180) if not self.exploration_mode else math.radians(90)
+
+            if dist_jump > max_dist or yaw_jump > max_yaw:
                 self.node.get_logger().warn(
-                    f"[Odom Filter] Ignorato salto anomalo: Δpos={dist_jump:.2f} m, Δyaw={math.degrees(yaw_jump):.1f}°"
+                    f"[Odom Filter] Ignored abnormal jump: Δpos={dist_jump:.2f} m, Δyaw={math.degrees(yaw_jump):.1f}°"
                 )
-                return  # Ignora questo frame
-
+                return
         self.current_pose = new_pose
-        self.node.get_logger().info(
-            f"Pose updated: x={pos.x:.2f}, y={pos.y:.2f}, yaw={math.degrees(yaw):.1f}°"
-        )
 
-    # =========================================================
-    # MAIN LOOP
-    # =========================================================
     def plan(self, img_msg):
         try:
             if self.exploration_mode:
                 err = self._exploration_step(img_msg)
             else:
                 err = self._exploitation_step(img_msg)
-
             # Pubblica stato (0 = Exploration, 1 = Exploitation)
             mode_msg = Float32()
             mode_msg.data = 0.0 if self.exploration_mode else 1.0
             self.mode_publisher.publish(mode_msg)
-
-            # Aggiorna visualizzazione mappa
-            if self.should_visualize:
-                self._visualize_map()
-
             return float(err) if not np.isnan(err) else 0.0
 
         except Exception as e:
             self.node.get_logger().error(f"[ExplorationBasedStrategy] Plan error: {e}")
             return 0.0
 
-    # =========================================================
-    # EXPLORATION MODE
-    # =========================================================
     def _exploration_step(self, img_msg):
         err = self.centerline_strategy.plan(img_msg)
-
-        # Converti l'immagine
         image = self.centerline_strategy.cv_bridge.imgmsg_to_cv2(img_msg, desired_encoding="bgr8")
         track_outline = self.centerline_strategy.get_track_outline(image)
         left, right = self.centerline_strategy.extract_track_limits(track_outline)
         centerline = self.centerline_strategy.compute_centerline(left, right)
-
-        # Se i limiti non ci sono, fallback
         if centerline is None or len(centerline) == 0:
             centerline = np.array([[self.centerline_strategy.prev_waypoint[0],
                                     self.centerline_strategy.prev_waypoint[1]]], dtype=float)
 
-        # Aggiorna la mappa con i punti attuali
         self._update_map(track_outline)
-
-        # --- 🔹 Calcolo curvatura da telecamera (in tempo reale) ---
         curvature_camera = self._predict_future_curvature_exploration(centerline)
         CURVATURE_THRESHOLD = 0.05  # Soglia di importanza
 
         if self.cycles_to_hold > 0:
-            # Modalità HOLD: Manteniamo il valore precedente
+            # Modality HOLD
             curvature_to_publish = self.held_curvature
             self.cycles_to_hold -= 1
 
-            # Se siamo vicini alla fine del blocco, controlliamo se la curva persiste
             if self.cycles_to_hold < 3 and abs(curvature_camera) > CURVATURE_THRESHOLD:
-                # Se la curva è ancora forte, resettiamo il timer
                 self.cycles_to_hold = self.hold_cycles
 
         elif abs(curvature_camera) >= CURVATURE_THRESHOLD:
-            # Modalità START HOLD: Trovata una curva forte
-            # Inizializza il timer e memorizza il valore.
+            # Modality START HOLD
             self.cycles_to_hold = self.hold_cycles
             self.held_curvature = curvature_camera
             curvature_to_publish = curvature_camera
 
         else:
-            # Modalità NORMALE: Usa il valore calcolato
             curvature_to_publish = curvature_camera
         curvature = curvature_to_publish
-        # Pubblica la curvatura
         curvature_msg = Float32()
         curvature_msg.data = float(curvature)
         self.curvature_publisher.publish(curvature_msg)
         curvature_msg = Float32()
         curvature_msg.data = abs(curvature_camera)
         self.curvature_publisher.publish(curvature_msg)
-
-        # Modifica l'errore in base alla curvatura (riduce la velocità nelle curve)
         err += curvature_camera * self.curvature_gain
-
-        # --- Controlla se la mappa è completata ---
-        '''if self._is_map_complete():
-            self.exploration_mode = False
-            self.node.get_logger().info("[ExplorationBasedStrategy] Mappa completata → modalità EXPLOITATION attiva.")'''
-
         return float(err) if not np.isnan(err) else 0.0
 
-    # =========================================================
-    # EXPLOITATION MODE
-    # =========================================================
     def _exploitation_step(self, img_msg):
+        """
+        Exploitation mode: follows the known track and adapts the vehicle’s velocity
+        based on the curvature profile computed in the global map.
+        """
+        # Standard steering control based on vision
         err = self.centerline_strategy.plan(img_msg)
-        current_centerline = self._estimate_current_centerline(img_msg)
-        if current_centerline is not None and len(current_centerline) > 0 and len(self.map_points) > 0:
-            curvature_ahead = self._predict_future_curvature(current_centerline)
+        if not hasattr(self, "velocity_profile") or len(self.velocity_profile) == 0:
+            self.node.get_logger().warn(
+                "[Exploitation] No velocity profile available, using local curvature estimation.")
+            current_centerline = self._estimate_current_centerline(img_msg)
+            curvature = self._predict_future_curvature(current_centerline)
+            velocity = 1.0 / (1.0 + 10.0 * abs(curvature))
+        else:
+            x_odom, y_odom, _ = self.current_pose
+            self.node.get_logger().info(f"[Exploitation] Pos=({x_odom:.2f},{y_odom:.2f})")
+            nearest_idx = np.argmin([
+                math.hypot(px - x_odom, py - y_odom)
+                for (px, py, _) in self.velocity_profile
+            ])
+            self.node.get_logger().info(f"[Exploitation] Nearest point: {nearest_idx}")
+            vx, vy, v_target = self.velocity_profile[nearest_idx]
+            # Low-pass filter to smooth velocity changes
+            alpha = 0.2
+            if hasattr(self, "prev_velocity"):
+                v_target = alpha * v_target + (1 - alpha) * self.prev_velocity
+            self.prev_velocity = v_target
+            velocity = v_target
+            vel_msg = Float32()
+            vel_msg.data = float(velocity)
+            self.node.create_publisher(Float32, '/planning/velocity', 10).publish(vel_msg)
+            curvature = self._predict_future_curvature_exploitation()
             curvature_msg = Float32()
-            curvature_msg.data = abs(curvature_ahead)
+            curvature_msg.data = float(curvature)
             self.curvature_publisher.publish(curvature_msg)
-            err += curvature_ahead * self.curvature_gain
-            self._highlight_lookahead_points(current_centerline)
+            # Diagnostic log
+            self.node.get_logger().info(
+                f"[Exploitation] Pos=({x_odom:.2f},{y_odom:.2f})  -> v_target={velocity:.2f} m/s"
+            )
         return float(err) if not np.isnan(err) else 0.0
 
-    # =========================================================
-    # SUPPORTO
-    # =========================================================
     def _update_map(self, track_outline):
         """
-        Trasforma i pixel della traccia dalla terna telecamera alla terna Odom.
+        Transforms the track pixels from the camera reference frame to the odometry frame.
         """
-        #self.node.get_logger().info("Updating map...")
-
-        # 1. Trova le coordinate dei pixel "gialli" (non-zero)
-        # Risultato: array (N, 2) di coordinate (riga=y, colonna=x) nell'immagine
-        # Prima di np.where(track_outline == 255)
+        # Apply morphological operations to clean the track mask
         track_outline = cv.morphologyEx(track_outline, cv.MORPH_OPEN, np.ones((3, 3), np.uint8))
         track_outline = cv.morphologyEx(track_outline, cv.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-
+        # Extract coordinates of detected track pixels
         row_indices, col_indices = np.where(track_outline == 255)
         yellow_pixel_coords = np.column_stack((row_indices, col_indices))
-
         if yellow_pixel_coords.size == 0:
-            self.node.get_logger().info("Nessun pixel della traccia rilevato.")
+            self.node.get_logger().info("No track pixels detected.")
             return
-
         yellow_pixel_coords = yellow_pixel_coords[::-1]
 
+        # Convert pixel coordinates from camera to vehicle reference frame
         points_camera = np.float32(yellow_pixel_coords[:, [1, 0]]).reshape(-1, 1, 2)
         points_vehicle = cv.perspectiveTransform(points_camera, self.M)
-        points_vehicle_2d = points_vehicle.squeeze()  # Ora è già in formato (X_avanti, Y_laterale)
-        # Filtro anti-outlier: tiene solo punti entro un range logico
+        points_vehicle_2d = points_vehicle.squeeze()
+        # Anti-outlier filter: keep only points within a logical range
         valid_mask = (points_vehicle_2d[:, 0] >= 0.0) & (points_vehicle_2d[:, 0] <= 1.0) & \
                      (np.abs(points_vehicle_2d[:, 1]) <= 1.0)
         points_vehicle_2d = points_vehicle_2d[valid_mask]
 
         if self.current_pose is None:
-            self.node.get_logger().warn("Posa Odom non disponibile.")
+            self.node.get_logger().warn("Odometry pose not available.")
             return
-
-        # 2. Trasformazione dalla terna del veicolo alla terna Odom (SENZA SCAMBIO DI ASSI)
         x_odom, y_odom, yaw_odom = self.current_pose
-
         c = np.cos(yaw_odom)
         s = np.sin(yaw_odom)
-        Rotation_matrix = np.array([[c, -s],
+        rotation_matrix = np.array([[c, -s],
                                     [s, c]])
-
-        # La rotazione e traslazione ora usano direttamente points_vehicle_2d
-        points_rotated = points_vehicle_2d @ Rotation_matrix.T
+        # Apply rotation and translation directly to points_vehicle_2d
+        points_rotated = points_vehicle_2d @ rotation_matrix.T
         points_odom = points_rotated + np.array([x_odom, y_odom])
-
-        self.node.get_logger().info(f"Le coordinate ODOM dei primi dieci punti gialli sono:\n{points_odom[:10]}")
-        # =========================================================
-        # Converti l'array NumPy di punti (N, 2) in una lista di tuple [(x1, y1), (x2, y2), ...]
-        # e aggiungi questi nuovi punti alla lista globale della mappa.
-        sampled_points_odom = points_odom[::10]
-
-        # ... (il resto del codice) ...
+        # Sample and update points on the 2D occupancy map
+        sampled_points_odom = points_odom[::1]
         for (x, y) in sampled_points_odom:
             px, py = self._world_to_map_coords(x, y)
             if px is not None and py is not None:
-                self.map_matrix[py, px] = 255  # bianco (tracciato)
+                self.map_matrix[py, px] = 255  # White (track path)
 
-        # Lancia la visualizzazione della mappa, se abilitata
+        # Launch map visualization if enabled
         if self.should_visualize:
             self._visualize_map()
 
-        # SALVA IL RISULTATO
-        #self.yellow_track_points_odom = points_odom
+        # Detect loop closure (returning to the same area)
+        if self._check_loop_closure(x_odom, y_odom):
+            self.node.get_logger().warn(
+                "[ExplorationBasedStrategy] Loop closure detected (same point visited three times). Switching to EXPLOITATION mode."
+            )
+            self.exploration_mode = False
 
+            # 🔹 Compute the velocity profile once upon switching mode
+            self.velocity_profile = self._compute_velocity_profile()
+            if len(self.velocity_profile) > 0:
+                self.node.get_logger().info(
+                    f"[Velocity Profile] Successfully computed with {len(self.velocity_profile)} points.")
+            else:
+                self.node.get_logger().warn("[Velocity Profile] Computation failed (track too short or incomplete).")
 
     def _estimate_current_centerline(self, img_msg):
         image = self.centerline_strategy.cv_bridge.imgmsg_to_cv2(img_msg, desired_encoding="bgr8")
@@ -355,69 +314,152 @@ class ExplorationBasedStrategy:
         else:
             return None, None
 
-    # =========================================================
-    # VISUALIZZAZIONE MAPPA
-    # =========================================================
-
     def _visualize_map(self):
         display_img = cv.cvtColor(self.map_matrix, cv.COLOR_GRAY2BGR)
-
-        # Disegna il robot
+        # Draw the robot
         if self.current_pose is not None:
             x_odom, y_odom, yaw_odom = self.current_pose
             lx, ly = self._world_to_map_coords(x_odom, y_odom)
             if lx is not None:
                 cv.circle(display_img, (lx, ly), 3, (0, 0, 255), -1)
-
-        cv.imshow("Exploration Map", display_img)
+        scale = 500 / display_img.shape[1]
+        debug_img_small = cv.resize(display_img, (0, 0), fx=scale, fy=scale, interpolation=cv.INTER_AREA)
+        cv.imshow("Exploration Map", debug_img_small,)
         cv.waitKey(1)
-
-    def _visualize_map2(self):
-        if not self.map_points:
-            return
-
-        if self.map_origin_world is None:
-            self.map_origin_world = (0.0, 0.0)  # <--- PUNTO CHIAVE
-
-        # --- Disegna i nuovi punti sulla mappa persistente ---
-        # Itera solo sui punti che non sono ancora stati disegnati
-        for i in range(self.last_drawn_index, len(self.map_points)):
-            x, y = self.map_points[i]
-            px, py = self._world_to_map_coords(x, y)
-
-            # Controlla se il punto è dentro i limiti dell'immagine prima di disegnarlo
-            if 0 <= px < self.map_size_pixels and 0 <= py < self.map_size_pixels:
-                cv.circle(self.map_img, (px, py), 1, (255, 255, 255), -1)
-
-        # Aggiorna l'indice per la prossima iterazione
-        self.last_drawn_index = len(self.map_points)
-
-        # --- Crea una copia temporanea per disegnare elementi dinamici ---
-        display_img = self.map_img.copy()
-
-        # Disegna la posizione corrente del veicolo (punto rosso)
-        x_odom, y_odom, yaw_odom = self.current_pose
-        lx, ly = self._world_to_map_coords(x_odom, y_odom)  # Usa la posa Odom
-        if lx is not None:
-            cv.circle(display_img, (lx, ly), 5, (0, 0, 255), -1)  # Più grande e rosso
-            #Aggiungi anche un vettore per lo Yaw per vedere l'orientamento!
-            # Disegna una linea che indica la direzione (lunga 0.5m)
-            tip_x = x_odom + 0.5 * np.cos(yaw_odom)
-            tip_y = y_odom + 0.5 * np.sin(yaw_odom)
-            tx, ty = self._world_to_map_coords(tip_x, tip_y)
-            if tx is not None:
-                cv.line(display_img, (lx, ly), (tx, ty), (0, 255, 255), 2) # Linea gialla per lo Yaw
-
-        # Disegna i punti di lookahead (punti verdi)
-        if hasattr(self, "lookahead_points") and self.lookahead_points:
-            for x, y in self.lookahead_points:
-                px, py = self._world_to_map_coords(x, y)
-                if px is not None:
-                    cv.circle(display_img, (px, py), 3, (0, 255, 0), -1)  # Verde
-
-        cv.imshow(self.window_name, display_img)
-        cv.waitKey(1)
-
 
     def _highlight_lookahead_points(self, current_centerline):
         pass
+
+    def _predict_future_curvature_exploitation(self):
+        if self.map_matrix is None or np.count_nonzero(self.map_matrix) < 10:
+            return 0.0
+        map_clean = cv.morphologyEx(self.map_matrix, cv.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        map_clean = cv.morphologyEx(map_clean, cv.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        _, bin_img = cv.threshold(map_clean, 127, 255, cv.THRESH_BINARY)
+        contours, _ = cv.findContours(bin_img, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE)
+        if not contours:
+            return 0.0
+        if self.current_pose is None:
+            return 0.0
+        x_odom, y_odom, yaw = self.current_pose
+        px, py = self._world_to_map_coords(x_odom, y_odom)
+        if px is None or py is None:
+            return 0.0
+        robot_pt = np.array([px, py])
+        closest_contour = min(contours, key=lambda c: np.min(np.linalg.norm(c.squeeze() - robot_pt, axis=1)))
+        pts = closest_contour.squeeze().astype(float)
+
+        # Converti lo yaw nel sistema di coordinate dell'immagine
+        map_yaw = -yaw
+        # Calcola l'angolo di ogni punto rispetto alla posizione del robot
+        vecs_from_robot = pts - robot_pt
+        # ### <<< NUOVA MODIFICA: Inverti l'asse X o Y per il calcolo dell'angolo
+        angles_in_map_frame = np.arctan2(-vecs_from_robot[:, 1], vecs_from_robot[:, 0])
+        # Normalizza la differenza angolare usando il `map_yaw` corretto
+        angle_diff = angles_in_map_frame - map_yaw
+        angle_diff_normalized = (angle_diff + np.pi) % (2 * np.pi) - np.pi
+        front_mask = np.abs(angle_diff_normalized) > (np.pi / 2)
+        pts_front = pts[front_mask]
+
+        if pts_front.shape[0] < 3:
+            return 0.0
+
+        dists_to_robot = np.linalg.norm(pts_front - robot_pt, axis=1)
+        lookahead_px = int(6.0 / self.map_resolution)
+        num_points_to_take = min(lookahead_px, len(pts_front))
+        sorted_indices = np.argsort(dists_to_robot)
+        nearest_indices = sorted_indices[:num_points_to_take]
+        local_pts = pts_front[nearest_indices]
+        if len(local_pts) < 3:
+            return 0.0
+        debug_img = cv.cvtColor(bin_img, cv.COLOR_GRAY2BGR)
+        cv.drawContours(debug_img, contours, -1, (0, 255, 0), 1)
+        cv.drawContours(debug_img, [closest_contour], -1, (0, 0, 255), 2)
+        cv.circle(debug_img, (int(px), int(py)), 8, (255, 0, 0), -1)
+        arrow_len = 30
+        arrow_end_x = int(px + arrow_len * np.cos(map_yaw))
+        arrow_end_y = int(py + arrow_len * np.sin(map_yaw))
+        cv.arrowedLine(debug_img, (int(px), int(py)), (arrow_end_x, arrow_end_y), (255, 255, 0), 3)  # Freccia gialla
+        for p in pts_front.astype(int):  # Itera su TUTTI i punti filtrati da front_mask
+            cv.circle(debug_img, tuple(p), 4, (255, 105, 180), -1)  # Disegna in rosa (RGB)
+        for p in local_pts.astype(int):
+            cv.circle(debug_img, tuple(p), 3, (0, 255, 255), -1)  # Punti gialli più piccoli
+
+        scale = 500 / debug_img.shape[1]
+        debug_img_small = cv.resize(debug_img, (0, 0), fx=scale, fy=scale, interpolation=cv.INTER_AREA)
+        cv.imshow("Contour Debug", debug_img_small)
+        cv.waitKey(1)
+
+        pts = np.array(local_pts, dtype=float)
+        dx = np.gradient(pts[:, 0])
+        dy = np.gradient(pts[:, 1])
+        ddx = np.gradient(dx)
+        ddy = np.gradient(dy)
+
+        denominator = np.power(dx ** 2 + dy ** 2, 1.5) + 1e-6
+        curvature = np.mean(np.abs((dx * ddy - dy * ddx) / denominator))
+
+        return float(-curvature)
+
+    def _check_loop_closure(self, x_odom, y_odom):
+        if not hasattr(self, "start_pose"):
+            self.start_pose = (x_odom, y_odom)
+            self.prev_pose = (x_odom, y_odom)
+            self.total_travelled = 0.0
+            self.loop_counter = 0
+
+            return False
+
+        # Distanza incrementale
+        dx = x_odom - self.prev_pose[0]
+        dy = y_odom - self.prev_pose[1]
+        ds = np.hypot(dx, dy)
+        self.total_travelled += ds
+        self.prev_pose = (x_odom, y_odom)
+        dist_from_start = np.hypot(x_odom - self.start_pose[0], y_odom - self.start_pose[1])
+        px, py = self._world_to_map_coords(x_odom, y_odom)
+        if px is None or py is None:
+            self.node.get_logger().info(f"PX OR PY ARE NONE")
+            return False
+
+        window_size = 10
+        x_min, x_max = max(0, px - window_size), min(self.map_size_pixels, px + window_size)
+        y_min, y_max = max(0, py - window_size), min(self.map_size_pixels, py + window_size)
+        local_patch = self.map_matrix[y_min:y_max, x_min:x_max]
+        visited_density = np.count_nonzero(local_patch)
+        self.node.get_logger().info(f"{self.total_travelled:.2f} m and {1.5 * self.map_size_meters}, {visited_density:.2f} admd {0.5 * (window_size ** 2)}, dist_from_start: {dist_from_start:.2f} ")
+
+        if (
+                self.total_travelled > 1.5 * self.map_size_meters
+                and visited_density > 0.5 * (window_size ** 2)
+        ):
+            self.loop_counter += 1
+            self.total_travelled=0
+
+        if self.loop_counter > 0:
+            self.node.get_logger().info(f"Loop closure detected after {self.total_travelled:.2f} m.")
+            self.hold_cycles = 0
+            return True
+        return False
+
+    def _compute_velocity_profile(self):
+        map_clean = cv.morphologyEx(self.map_matrix, cv.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        map_skel = skeletonize(map_clean > 0)
+        y_idx, x_idx = np.where(map_skel == 1)
+
+        pts = np.column_stack((x_idx, y_idx)).astype(float)
+        if len(pts) < 5:
+            return []
+        dx = np.gradient(pts[:, 0])
+        dy = np.gradient(pts[:, 1])
+        ddx = np.gradient(dx)
+        ddy = np.gradient(dy)
+        denom = np.power(dx ** 2 + dy ** 2, 1.5) + 1e-6
+        curvature = (dx * ddy - dy * ddx) / denom
+        vmax = 3.0
+        k = 10.0
+        velocity_profile = vmax / (1 + k * curvature)
+        # salva come lista [(x, y, v)]
+        return [(pts[i, 0], pts[i, 1], velocity_profile[i]) for i in range(len(pts))]
+
+
