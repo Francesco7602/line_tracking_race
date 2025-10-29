@@ -85,7 +85,7 @@ class ExplorationBasedStrategy:
             dist_jump = math.hypot(new_pose[0] - old_x, new_pose[1] - old_y)
             yaw_jump = abs((new_pose[2] - old_yaw + math.pi) % (2 * math.pi) - math.pi)
 
-            max_dist = 2.0 if not self.exploration_mode else 0.5
+            max_dist = 1.0 if not self.exploration_mode else 0.5
             max_yaw = math.radians(180) if not self.exploration_mode else math.radians(90)
 
             if dist_jump > max_dist or yaw_jump > max_yaw:
@@ -314,6 +314,21 @@ class ExplorationBasedStrategy:
         else:
             return None, None
 
+    def _map_to_world_coords(self, pixel_x, pixel_y):
+        """
+        Converte le coordinate della mappa (pixel) in coordinate del mondo (metri).
+        Questa è l'inversa esatta di _world_to_map_coords.
+        """
+        # Inverti il calcolo per la x
+        world_x = self.map_origin_world[0] + \
+                  (pixel_x - self.map_origin_pixels[0]) * self.map_resolution
+
+        # Inverti il calcolo per la y (nota l'inversione del segno)
+        world_y = self.map_origin_world[1] - \
+                  (pixel_y - self.map_origin_pixels[1]) * self.map_resolution
+
+        return world_x, world_y
+
     def _visualize_map(self):
         display_img = cv.cvtColor(self.map_matrix, cv.COLOR_GRAY2BGR)
         # Draw the robot
@@ -445,21 +460,33 @@ class ExplorationBasedStrategy:
     def _compute_velocity_profile(self):
         map_clean = cv.morphologyEx(self.map_matrix, cv.MORPH_OPEN, np.ones((3, 3), np.uint8))
         map_skel = skeletonize(map_clean > 0)
+
+        # 1. Trova i punti dello scheletro in PIXEL
         y_idx, x_idx = np.where(map_skel == 1)
 
-        pts = np.column_stack((x_idx, y_idx)).astype(float)
+        # 2. Converti ogni punto (px, py) in (world_x, world_y)
+        world_points = []
+        for px, py in zip(x_idx, y_idx):
+            wx, wy = self._map_to_world_coords(px, py)  # <-- USA LA NUOVA FUNZIONE
+            world_points.append((wx, wy))
+
+        pts = np.array(world_points).astype(float)
         if len(pts) < 5:
             return []
+
+        # 3. Ora calcola la curvatura su PTS (che sono in METRI)
         dx = np.gradient(pts[:, 0])
         dy = np.gradient(pts[:, 1])
         ddx = np.gradient(dx)
         ddy = np.gradient(dy)
         denom = np.power(dx ** 2 + dy ** 2, 1.5) + 1e-6
         curvature = (dx * ddy - dy * ddx) / denom
-        vmax = 3.0
-        k = 10.0
-        velocity_profile = vmax / (1 + k * curvature)
-        # salva come lista [(x, y, v)]
-        return [(pts[i, 0], pts[i, 1], velocity_profile[i]) for i in range(len(pts))]
 
+        vmax = 4.0
+        k = 10.0
+        velocity_profile = vmax / (1 + k * np.abs(curvature))  # Usa np.abs per la velocità!
+
+        # 4. Salva il profilo con coordinate in METRI
+        #    (la x è pts[i, 0], la y è pts[i, 1])
+        return [(pts[i, 0], pts[i, 1], velocity_profile[i]) for i in range(len(pts))]
 

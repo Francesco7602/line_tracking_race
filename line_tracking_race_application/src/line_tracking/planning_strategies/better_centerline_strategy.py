@@ -110,7 +110,7 @@ class BetterCenterlineStrategy:
         # - Remove 100 pixels from left/right borders to eliminate edge artifacts
         cropped_outline = track_outline[
             : (height),
-            50 : (width - 50)              # Horizontal crop: remove 100px borders
+            75 : (width - 75)              # Horizontal crop: remove 100px borders
         ]
         cr_height, cr_width = cropped_outline.shape
 

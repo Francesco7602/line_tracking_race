@@ -1,9 +1,13 @@
 """
-ROS2 PID Control Node for Line Tracking Robot
-
-This module implements a PID controller for a differential drive robot performing
-line tracking tasks. The controller receives error signals from a planning node
-and outputs velocity commands to minimize tracking error.
+ROS2 PID Control Node for Line Tracking Robot (Stabilized Version)
+---------------------------------------------------------------
+Versione migliorata con:
+- Anti-windup per termine integrale
+- Filtro derivata (low-pass)
+- Saturazione output (angular e thrust)
+- Inizializzazione corretta di prev_error
+- Protezione da dt instabili
+- Log completo e stabile
 """
 
 import os
@@ -17,283 +21,217 @@ from std_msgs.msg import Float32
 from geometry_msgs.msg import Twist
 from ament_index_python.packages import get_package_share_directory
 
-# Control constants
-MAX_THRUST = 3.0 #2.83   # Maximum forward velocity (m/s) anche diminuendo l-errore non sis tabilizza ahaha
-RAMP_UP = 0.5         # Thrust increment per control cycle for smooth acceleration
+# === Costanti di controllo ===
+MAX_THRUST = 3.0       # m/s - velocità lineare massima
+MAX_ANGULAR = 2.0      # rad/s - limite massimo angolare
+RAMP_UP = 0.5          # incremento thrust per ciclo
+I_MAX = 5.0            # limite integrale assoluto
+DERIV_FILTER_ALPHA = 0.7  # coefficiente filtro derivata (0..1)
 
 class BetterControlNode(Node):
-    """
-    ROS2 Node implementing PID control for line tracking.
-
-    This node subscribes to error messages from a planning node and publishes
-    velocity commands to control a differential drive robot. It implements
-    PID control with configurable parameters and includes comprehensive logging
-    for performance analysis.
-
-    Attributes:
-        max_duration (float): Maximum duration to run control loop (-1 for infinite)
-        k_p (float): Proportional gain for PID controller
-        k_i (float): Integral gain for PID controller
-        k_d (float): Derivative gain for PID controller
-        setpoint (float): Desired error value (typically 0)
-        prev_error (float): Previous error value for derivative calculation
-        accumulated_integral (float): Accumulated integral term
-        thrust (float): Current forward thrust value
-        ISE (float): Integral of Squared Error performance metric
-        started (bool): Flag indicating if control loop has started
-        time_start (rclpy.Time): Timestamp when control started
-        time_prev (rclpy.Time): Previous timestamp for dt calculation
-    """
-
     def __init__(self):
-        """Initialize the control node with parameters, publishers, subscribers, and logging."""
         super().__init__('control_node')
 
-        # Declare and retrieve ROS2 parameters
+        # --- Parametri ROS2 ---
         self._declare_parameters()
         self._get_parameters()
 
         self.get_logger().info(f"PID params: P={self.k_p}, I={self.k_i}, D={self.k_d}")
 
-        # Initialize logging system
+        # --- Logging e stato PID ---
         self._setup_logging()
-
-        # Initialize PID control variables
         self._initialize_control_variables()
-
-        # Setup ROS2 communication
         self._setup_ros_communication()
 
         self.get_logger().info("Control node initialized successfully!")
-        self.current_curvature = 0.0
-        self.target_velocity = None
-        self.target_angular = None
 
-
+    # ==========================================================
+    #  Dichiarazione parametri
+    # ==========================================================
     def _declare_parameters(self):
-        """Declare ROS2 parameters with default values."""
-        self.declare_parameter("duration", -1.0)  # -1 means no time limit
-        self.declare_parameter("k_p", 4.8)       # Proportional gain  4.8 for 3
-        self.declare_parameter("k_i", 0.01)       # Integral gain 0.01 for 3
-        self.declare_parameter("k_d", 0.4)       # Derivative gain 0.4 for 3
+        self.declare_parameter("duration", -1.0)
+        self.declare_parameter("k_p", 0.08)  # Leggermente ridotto per meno aggressività
+        self.declare_parameter("k_i", 0.02)  # Drasticamente ridotto per fermare le oscillazioni
+        self.declare_parameter("k_d", 0.4)
 
     def _get_parameters(self):
-        """Retrieve parameter values from ROS2 parameter server."""
         self.max_duration = self.get_parameter("duration").get_parameter_value().double_value
         self.k_p = self.get_parameter("k_p").get_parameter_value().double_value
         self.k_i = self.get_parameter("k_i").get_parameter_value().double_value
         self.k_d = self.get_parameter("k_d").get_parameter_value().double_value
 
+    # ==========================================================
+    #  Setup logging
+    # ==========================================================
     def _setup_logging(self):
-        """Initialize CSV logging files for data collection and performance evaluation."""
-        # Create timestamp for unique filenames
         date = datetime.today().strftime("%Y-%m-%d_%H-%M-%S")
         self.pkg_path = get_package_share_directory("line_tracking_race_application")
-
-        # Open main data logging file
         self.open_logfile(date)
-
-        # Open performance evaluation file
         self.open_performance_evaluation_file(date)
         self.errors = []
         self.times = []
 
     def _initialize_control_variables(self):
-        """Initialize PID control and state variables."""
-        # PID control variables
-        self.setpoint = 0.0                    # Target error (0 = perfect line following)
-        self.prev_error = 0.0                  # Previous error for derivative term
-        self.accumulated_integral = 0.0        # Accumulated integral for I term
-        self.thrust = 0.0                      # Current forward velocity
-        self.ISE = 0.0                        # Integral of Squared Error metric
-
-        # State management variables
-        self.started = False                   # Control loop state flag
-        self.time_start = None                # Start time for elapsed time calculation
-        self.time_prev = None                 # Previous time for dt calculation
+        self.setpoint = 0.0
+        self.prev_error = 0.0
+        self.accumulated_integral = 0.0
+        self.thrust = 0.0
+        self.ISE = 0.0
+        self.started = False
+        self.time_start = None
+        self.time_prev = None
+        self.d_prev = 0.0
+        self._pid_initialized = False
 
     def _setup_ros_communication(self):
-        """Initialize ROS2 publishers and subscribers."""
         self.cmd_vel = self.create_publisher(Twist, "/car/cmd_vel", 10)
-        self.error_sub = self.create_subscription(
-            Float32,
-            "/planning/error",
-            self.handle_error_callback,
-            10
-        )
-        self.curvature_sub = self.create_subscription(
-            Float32,
-            "/planning/curvature",
-            self.handle_curvature_callback,
-            10
-        )
-        self.velocity_sub = self.create_subscription(
-            Float32,
-            "/planning/velocity",
-            self.handle_velocity_callback,
-            10
-        )
+        self.error_sub = self.create_subscription(Float32, "/planning/error", self.handle_error_callback, 10)
+        self.curvature_sub = self.create_subscription(Float32, "/planning/curvature", self.handle_curvature_callback, 10)
+        self.velocity_sub = self.create_subscription(Float32, "/planning/velocity", self.handle_velocity_callback, 10)
+        self.current_curvature = 0.0
+        self.target_velocity = None
 
+    # ==========================================================
+    #  Callback principali
+    # ==========================================================
     def handle_curvature_callback(self, msg):
-        """Handle incoming curvature messages."""
         self.current_curvature = msg.data
 
-    def handle_error_callback(self, msg):
-        """
-        Main PID control callback function.
-
-        This function is called whenever a new error message is received from
-        the planning node. It implements the PID control algorithm and publishes
-        appropriate velocity commands.
-
-        Args:
-            msg (Float32): ROS2 message containing the tracking error
-        """
-        if self.target_velocity is not None:# and self.target_angular is not None:
-            linear_x = self.target_velocity
-            angular_z = self.target_velocity * self.current_curvature
-            self.get_logger().info(
-                f"Using planned velocity: {linear_x:.2f} m/s, angular: {angular_z:.2f} rad/s, curvature: {self.current_curvature:.2f}")
-        else:
-            error = msg.data
-            self.errors.append(error)
-            time_now = self.get_clock().now()
-            self.times.append(time_now.nanoseconds / 1e9)
-
-            # Initialize timing on first callback
-            if not self.started:
-                self.time_start = time_now
-                self.time_prev = time_now
-                self.started = True
-                return
-
-            # Calculate elapsed time and time delta
-            elapsed = (time_now - self.time_start).nanoseconds / 1e9
-            dt = (time_now - self.time_prev).nanoseconds / 1e9
-
-
-            # Check for duration timeout (if specified)
-            if self.max_duration >= 0.0 and elapsed > self.max_duration:
-                self.get_logger().warn("Maximum duration reached. Stopping robot.")
-                self.stop()
-                return
-
-            # Skip control update if time delta is invalid
-            if dt <= 0.0:
-                return
-
-            # Update performance metrics
-            self._update_performance_metrics(error, dt)
-
-            # Calculate PID control output
-            control_output = self._calculate_pid_control(error, dt)
-
-            # Update state variables for next iteration
-            self.prev_error = error
-            self.time_prev = time_now
-
-            # Apply smooth thrust ramp-up for gentle acceleration
-            self._update_thrust()
-            linear_x = self.thrust      # Forward velocity
-            angular_z = control_output  # Angular velocity (steering)
-        self.publish_cmd_vel(linear_x, angular_z)
-
     def handle_velocity_callback(self, msg):
-        """
-        Handle incoming velocity messages from the planning node.
-        This message sets the desired forward velocity (m/s).
-        """
         self.target_velocity = msg.data
         self.get_logger().info(f"Received target velocity: {self.target_velocity:.2f} m/s")
 
-    def _update_performance_metrics(self, error, dt):
-        """
-        Update performance metrics for controller evaluation.
+    def handle_error_callback(self, msg):
+        error = msg.data
+        self.errors.append(error)
+        time_now = self.get_clock().now()
+        self.times.append(time_now.nanoseconds / 1e9)
 
-        Args:
-            error (float): Current tracking error
-            dt (float): Time delta since last update
-        """
-        # Calculate Integral of Squared Error using trapezoidal integration
+        # Inizializzazione temporale
+        if not self.started:
+            self.time_start = time_now
+            self.time_prev = time_now
+            self.started = True
+            self.prev_error = error
+            return
+
+        elapsed = (time_now - self.time_start).nanoseconds / 1e9
+        dt = (time_now - self.time_prev).nanoseconds / 1e9
+        if dt <= 0.0:
+            return
+
+        # Timeout durata
+        if self.max_duration >= 0.0 and elapsed > self.max_duration:
+            self.get_logger().warn("Maximum duration reached. Stopping robot.")
+            self.stop()
+            return
+
+        self._update_performance_metrics(error, dt)
+        control_output = self._calculate_pid_control(error, dt)
+        self.prev_error = error
+        self.time_prev = time_now
+
+        # Aggiorna thrust
+        self._update_thrust()
+
+        linear_x = self.thrust
+        angular_z = control_output
+
+        # Saturazione finale (sicurezza)
+        angular_z = max(-MAX_ANGULAR, min(MAX_ANGULAR, angular_z))
+        linear_x = max(0.0, min(MAX_THRUST, linear_x))
+
+        self.publish_cmd_vel(linear_x, angular_z)
+
+    # ==========================================================
+    #  Calcolo PID
+    # ==========================================================
+    def _update_performance_metrics(self, error, dt):
         self.ISE += dt * (error**2 + self.prev_error**2) / 2.0
 
     def _calculate_pid_control(self, error, dt):
-        """
-        Calculate PID control output.
+        # Inizializzazione primo ciclo
+        if not self._pid_initialized:
+            self.prev_error = error
+            self._pid_initialized = True
 
-        Args:
-            error (float): Current tracking error
-            dt (float): Time delta since last update
+        # Integrale con anti-windup
+        self.accumulated_integral += 0.5 * (error + self.prev_error) * dt
+        self.accumulated_integral = max(-I_MAX, min(I_MAX, self.accumulated_integral))
 
-        Returns:
-            float: PID control output (angular velocity command)
-        """
-        # Update integral term using trapezoidal integration
-        # Uses average of current and previous error, providing better approximation of the actual integral.
-        self.accumulated_integral += dt * (error + self.prev_error) / 2.0
+        # Calcolo termini PID
+        p_term = self.k_p * error
+        i_term = self.k_i * self.accumulated_integral
 
-        # Calculate individual PID terms
-        p_term = self.k_p * error                                    # Proportional term
-        i_term = self.k_i * self.accumulated_integral               # Integral term
-        d_term = self.k_d * (error - self.prev_error) / dt         # Derivative term
+        raw_d = (error - self.prev_error) / dt
+        d_filtered = DERIV_FILTER_ALPHA * self.d_prev + (1.0 - DERIV_FILTER_ALPHA) * raw_d
+        self.d_prev = d_filtered
+        d_term = self.k_d * d_filtered
 
-        # Combine terms for final control output
         control_output = p_term + i_term + d_term
+
+        # Saturazione angolare
+        control_output = max(-MAX_ANGULAR, min(MAX_ANGULAR, control_output))
+
+        # Logging interno
+        try:
+            elapsed = (self.get_clock().now() - self.time_start).nanoseconds / 1e9
+            self.log_data(elapsed, dt, error, control_output, self.thrust, control_output, p_term, i_term, d_term)
+        except Exception:
+            pass
 
         return control_output
 
+    # ==========================================================
+    #  Gestione velocità e comandi
+    # ==========================================================
     def _update_thrust(self):
-        """Apply smooth thrust ramp-up with curvature-based speed control."""
         if self.target_velocity is not None:
             self.thrust = self.target_velocity
         else:
-            curvature = min(max(self.current_curvature, 0.0), 1.0)
-            speed_factor = 1.0 - (curvature * 5)
-            target_thrust = MAX_THRUST * speed_factor
-            self.get_logger().info(f"Curvature: {curvature:.2f}, Speed Factor: {speed_factor:.2f}, Target: {target_thrust:.2f}")
+            curvature = max(min(self.current_curvature, 1.0), -1.0)
+            speed_factor = max(0.0, 1.0 - (abs(curvature) * 3.0))
+            target_thrust = max(0.0, MAX_THRUST * speed_factor)
+
             if self.thrust < target_thrust:
                 self.thrust += RAMP_UP
-                if self.thrust > target_thrust:
-                    self.thrust = target_thrust
+                self.thrust = min(self.thrust, target_thrust)
             elif self.thrust > target_thrust:
                 self.thrust -= RAMP_UP
-                if self.thrust < target_thrust:
-                    self.thrust = target_thrust
+                self.thrust = max(self.thrust, target_thrust)
 
     def publish_cmd_vel(self, linear_x, angular_z):
-        """
-        Publish velocity commands to the robot.
-
-        Args:
-            linear_x (float): Forward velocity command (m/s)
-            angular_z (float): Angular velocity command (rad/s)
-        """
         twist_msg = Twist()
         twist_msg.linear.x = linear_x
         twist_msg.angular.z = angular_z
         self.cmd_vel.publish(twist_msg)
 
+    # ==========================================================
+    #  Logging CSV e grafici
+    # ==========================================================
     def open_logfile(self, date):
-        """
-        Open CSV file for logging control data.
-
-        Args:
-            date (str): Timestamp string for unique filename
-        """
-        # Create filename with PID parameters for easy identification
         pid_params = f"{self.k_p}-{self.k_i}-{self.k_d}".replace(".", ",")
         log_dir = os.path.join(self.pkg_path, "logs")
         os.makedirs(log_dir, exist_ok=True)
         filepath = os.path.join(log_dir, f"pid_log_{date}_[{pid_params}].csv")
-
-        # Open file and setup CSV writer
         self.logfile = open(filepath, "w", newline="")
         self.log_writer = csv.writer(self.logfile)
+        self.log_writer.writerow(["Time", "dt", "Error", "CV", "LinearV", "AngularV", "P", "I", "D"])
 
-        # Write header row
-        self.log_writer.writerow([
-            "Time", "dt", "Error", "CV", "LinearV", "AngularV", "P", "I", "D"
-        ])
+    def open_performance_evaluation_file(self, date):
+        pid_params = f"{self.k_p}-{self.k_i}-{self.k_d}".replace(".", ",")
+        eval_dir = os.path.join(self.pkg_path, "logs", "evaluations")
+        os.makedirs(eval_dir, exist_ok=True)
+        filepath = os.path.join(eval_dir, f"evaluation_{date}_[{pid_params}].csv")
+        self.evaluation_file = open(filepath, "w", newline="")
+        self.performance_index_writer = csv.writer(self.evaluation_file)
+        self.performance_index_writer.writerow(["ISE"])
+
+    def log_data(self, elapsed, dt, error, control, linear_x, angular_z, p_term, i_term, d_term):
+        self.log_writer.writerow([elapsed, dt, error, control, linear_x, angular_z, p_term, i_term, d_term])
+
+    def log_performance_indices(self):
+        self.performance_index_writer.writerow([self.ISE])
 
     def plot_error(self):
         plt.figure()
@@ -305,105 +243,41 @@ class BetterControlNode(Node):
         plt.legend()
         plt.show()
 
-    def open_performance_evaluation_file(self, date):
-        """
-        Open CSV file for logging performance evaluation metrics.
-
-        Args:
-            date (str): Timestamp string for unique filename
-        """
-        # Create filename with PID parameters
-        pid_params = f"{self.k_p}-{self.k_i}-{self.k_d}".replace(".", ",")
-        eval_dir = os.path.join(self.pkg_path, "logs", "evaluations")
-        os.makedirs(eval_dir, exist_ok=True)
-        filepath = os.path.join(eval_dir, f"evaluation_{date}_[{pid_params}].csv")
-
-        # Open file and setup CSV writer
-        self.evaluation_file = open(filepath, "w", newline="")
-        self.performance_index_writer = csv.writer(self.evaluation_file)
-
-        # Write header row
-        self.performance_index_writer.writerow(["ISE"])
-
-    def log_data(self, elapsed, dt, error, control, linear_x, angular_z, p_term, i_term, d_term):
-        """
-        Log control data to CSV file.
-
-        Args:
-            elapsed (float): Elapsed time since start
-            dt (float): Time delta since last update
-            error (float): Current tracking error
-            control (float): PID control output
-            linear_x (float): Forward velocity command
-            angular_z (float): Angular velocity command
-            p_term (float): Proportional term value
-            i_term (float): Integral term value
-            d_term (float): Derivative term value
-        """
-        self.log_writer.writerow([
-            elapsed, dt, error, control, linear_x, angular_z, p_term, i_term, d_term
-        ])
-
-    def log_performance_indices(self):
-        """Log final performance metrics to evaluation file."""
-        self.performance_index_writer.writerow([self.ISE])
-
+    # ==========================================================
+    #  Arresto sicuro
+    # ==========================================================
     def stop(self):
-        """
-        Stop the robot and perform cleanup operations.
-
-        This method is called when the control loop should terminate, either
-        due to timeout or external interruption. It ensures the robot stops
-        safely and logs are properly closed.
-        """
         self.get_logger().info("Stopping robot...")
 
-        # Create and publish zero velocity command to stop the robot
         twist_msg = Twist()
         twist_msg.linear.x = 0.0
         twist_msg.angular.z = 0.0
 
-        # Publish multiple times to ensure message gets through
         for _ in range(10):
             self.cmd_vel.publish(twist_msg)
 
-        # Log final performance metrics and close files
         self.log_performance_indices()
         self.logfile.close()
         self.evaluation_file.close()
-
         self.get_logger().info("Control node shutting down.")
         rclpy.shutdown()
 
-
+# ==========================================================
+#  MAIN
+# ==========================================================
 def main(args=None):
-    """
-    Main function to initialize and run the control node.
-
-    Args:
-        args: Command line arguments (optional)
-    """
-    # Initialize ROS2 Python client library
     rclpy.init(args=args)
-
-    # Create and start the control node
     node = BetterControlNode()
-
     try:
-        # Run the node until interrupted
         rclpy.spin(node)
     except KeyboardInterrupt:
-        # Handle graceful shutdown on Ctrl+C
         node.plot_error()
         node.stop()
     finally:
-        # Cleanup resources
         if rclpy.ok():
             node.plot_error()
-
             node.destroy_node()
             rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()
