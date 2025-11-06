@@ -26,7 +26,7 @@ MAX_THRUST = 3.0       # m/s - velocità lineare massima
 MAX_ANGULAR = 2.0      # rad/s - limite massimo angolare
 RAMP_UP = 0.5          # incremento thrust per ciclo
 I_MAX = 5.0            # limite integrale assoluto
-DERIV_FILTER_ALPHA = 0.7  # coefficiente filtro derivata (0..1)
+DERIV_FILTER_ALPHA = 0.95  # coefficiente filtro derivata (0..1)
 
 class BetterControlNode(Node):
     def __init__(self):
@@ -50,15 +50,15 @@ class BetterControlNode(Node):
     # ==========================================================
     def _declare_parameters(self):
         self.declare_parameter("duration", -1.0)
-        self.declare_parameter("k_p", 0.08)  # Leggermente ridotto per meno aggressività
-        self.declare_parameter("k_i", 0.02)  # Drasticamente ridotto per fermare le oscillazioni
-        self.declare_parameter("k_d", 0.4)
+        self.declare_parameter("k_p", 0.0)  # Leggermente ridotto per meno aggressività, prima 0.06
+        self.declare_parameter("k_i", 0.0)  # prima 0.005Drasticamente ridotto per fermare le oscillazioni
+        self.declare_parameter("k_d", 0.0) #prima 0.2
 
     def _get_parameters(self):
         self.max_duration = self.get_parameter("duration").get_parameter_value().double_value
-        self.k_p = self.get_parameter("k_p").get_parameter_value().double_value
-        self.k_i = self.get_parameter("k_i").get_parameter_value().double_value
-        self.k_d = self.get_parameter("k_d").get_parameter_value().double_value
+        self.k_p = 3.0#self.get_parameter("k_p").get_parameter_value().double_value
+        self.k_i = 0.0#self.get_parameter("k_i").get_parameter_value().double_value
+        self.k_d = 1.2#self.get_parameter("k_d").get_parameter_value().double_value
 
     # ==========================================================
     #  Setup logging
@@ -82,6 +82,14 @@ class BetterControlNode(Node):
         self.time_prev = None
         self.d_prev = 0.0
         self._pid_initialized = False
+        # smoothing per curvatura (low-pass esponenziale)
+        self.curv_filtered = 0.0
+        self.curv_filter_alpha = 0.2  # 0..1, piccolo = più smoothing
+        # parametri feedforward
+        self.k_ff_base = 1.0#2.8  # valore iniziale consigliato (prova 0.15-0.6)
+        self.curv_ff_threshold = 0.0  # soglia sotto cui non anticipare
+        self.ff_speed_min = 0.2  # velocità minima per applicare feedforward
+        self.ff_speed_max = 8.0  # velocità massima per scaling
 
     def _setup_ros_communication(self):
         self.cmd_vel = self.create_publisher(Twist, "/car/cmd_vel", 10)
@@ -101,6 +109,92 @@ class BetterControlNode(Node):
         self.target_velocity = msg.data
         self.get_logger().info(f"Received target velocity: {self.target_velocity:.2f} m/s")
 
+    def _apply_saturation_and_publish(self, linear_x, angular_z):
+        """
+        Applica saturazioni soft e publish dei comandi.
+        - linear_x: comando lineare calcolato dal controller (m/s o unità usate)
+        - angular_z: comando angolare grezzo calcolato dal controller (rad/s o unità usate)
+
+        NOTE:
+        - Usa soft-saturation (tanh) per evitare cut bruschi.
+        - Riduce la velocità in funzione dell'entità della sterzata richiesta.
+        - Parametri tunable sotto: MODIFICARE a piacere e loggare i risultati.
+        """
+
+        import math
+        # ----------------------------
+        # Parametri tunabili (modifica per il tuo veicolo/simulatore)
+        MIN_ANG = 3.5  # saturazione angolare minima (rad/s) ai bassi regimi
+        ANG_SLOPE = 0.6  # pendenza: quanto aumenta max_ang al crescere della velocità
+        ANG_OFFSET = 3.0  # offset addizionale
+        MAX_ANG_LIMIT = 10.0  # limite superiore assoluto (protezione)
+        MAX_THRUST = getattr(self, "MAX_THRUST", 3.0)  # valore presente nel tuo codice
+        # quanto ridurre la velocità in curva (0.0 = non ridurre, 1.0 = riduzione massima)
+        MAX_SPEED_REDUCTION_RATIO = 0.30  # fino al 50% di riduzione in curva
+        # soglia di "saturazione percepita" per logging/anti-windup
+        SATURATION_WARN_RATIO = 0.95
+        # ----------------------------
+
+        # ricava la velocità corrente (usa self.thrust se presente, altrimenti target)
+        v = getattr(self, "thrust", None)
+        if v is None:
+            v = getattr(self, "target_velocity", 0.0)
+        # garantisci valore non nullo per le formule
+        v = float(max(0.0, v))
+
+        # calcola max angolare dinamico (monotonicamente crescente con v)
+        max_ang = ANG_SLOPE * v + ANG_OFFSET
+        if max_ang < MIN_ANG:
+            max_ang = MIN_ANG
+        if max_ang > MAX_ANG_LIMIT:
+            max_ang = MAX_ANG_LIMIT
+
+        # --- soft saturation su angular_z ---
+        # se angular_z è grande rispetto a max_ang, applichiamo una tanh per smussare
+        # angular_z_saturated = max_ang * tanh( angular_z / max_ang )
+        if max_ang > 0.0:
+            angular_ratio = angular_z / max_ang
+            angular_z_saturated = max_ang * math.tanh(angular_ratio)
+        else:
+            angular_z_saturated = angular_z
+
+        # --- riduzione della velocità in curva (velocity shaping) ---
+        # più è alta la frazione |angular|/max_ang, più riduciamo linear_x (fino a MAX_SPEED_REDUCTION_RATIO)
+        turn_aggressiveness = min(1.0, abs(angular_z_saturated) / (max_ang + 1e-6))
+        speed_reduction_factor = 1.0 - MAX_SPEED_REDUCTION_RATIO * turn_aggressiveness
+        linear_x_after = max(0.0, linear_x) * speed_reduction_factor
+        # --- anti-windup (semplice, non invasivo) ---
+        # segnala al PID se siamo in saturazione così puoi decidere di frenare l'integrale.
+        saturated_ang = abs(angular_z_saturated) >= (SATURATION_WARN_RATIO * max_ang)
+        saturated_lin = linear_x_after >= (SATURATION_WARN_RATIO * MAX_THRUST)
+        # se hai un metodo PID con anti-windup, chiamalo qui; altrimenti puoi ridurre l'integrale manualmente:
+        if saturated_ang or saturated_lin:
+            # esempio non invasivo: scala leggermente integrale se esiste
+            pid = getattr(self, "pid", None)
+            if pid is not None and hasattr(pid, "integral"):
+                # riduce l'integrale del 10% per evitare accumulo se saturati (tweak a piacere)
+                try:
+                    pid.integral *= 0.9
+                except Exception:
+                    pass
+
+        # --- publish ---
+        # finalmente pubblica i comandi
+        self.publish_cmd_vel(linear_x_after, angular_z_saturated)
+
+        # --- logging utile per debug (sostituisci print con il tuo logger) ---
+        debug_line = {
+            "v": v,
+            "requested_linear": linear_x,
+            "linear_after": linear_x_after,
+            "requested_angular": angular_z,
+            "angular_after": angular_z_saturated,
+            "max_ang": max_ang,
+            "turn_aggressiveness": turn_aggressiveness,
+            "saturated_ang": saturated_ang,
+            "saturated_lin": saturated_lin
+        }
+        self.get_logger().info(f"Control loop: {debug_line}")
     def handle_error_callback(self, msg):
         error = msg.data
         self.errors.append(error)
@@ -138,10 +232,12 @@ class BetterControlNode(Node):
         angular_z = control_output
 
         # Saturazione finale (sicurezza)
-        angular_z = max(-MAX_ANGULAR, min(MAX_ANGULAR, angular_z))
-        linear_x = max(0.0, min(MAX_THRUST, linear_x))
+        dynamic_global_max = max(2.0, 0.5 * self.thrust + 2.0)  # esempio
+        #angular_z = max(-dynamic_global_max, min(dynamic_global_max, angular_z))
+        #angular_z = max(-MAX_ANGULAR, min(MAX_ANGULAR, angular_z))
+        linear_x = max(0.0, linear_x)#min(MAX_THRUST, linear_x))
 
-        self.publish_cmd_vel(linear_x, angular_z)
+        self._apply_saturation_and_publish(linear_x, angular_z)
 
     # ==========================================================
     #  Calcolo PID
@@ -150,33 +246,117 @@ class BetterControlNode(Node):
         self.ISE += dt * (error**2 + self.prev_error**2) / 2.0
 
     def _calculate_pid_control(self, error, dt):
+        # ==============================
         # Inizializzazione primo ciclo
+        # ==============================
         if not self._pid_initialized:
             self.prev_error = error
             self._pid_initialized = True
 
+        # ==============================
         # Integrale con anti-windup
-        self.accumulated_integral += 0.5 * (error + self.prev_error) * dt
+        # ==============================
+        if self.target_velocity is not None:
+            if abs(error) < 0.2 and self.target_velocity < 5.0:
+                self.accumulated_integral += 0.5 * (error + self.prev_error) * dt
+            else:
+                # scarica lentamente l’integratore per evitare accumulo in manovre brusche
+                self.accumulated_integral *= 0.9
+        else:
+            self.accumulated_integral += 0.5 * (error + self.prev_error) * dt
+
         self.accumulated_integral = max(-I_MAX, min(I_MAX, self.accumulated_integral))
 
+        # ==============================
         # Calcolo termini PID
+        # ==============================
         p_term = self.k_p * error
         i_term = self.k_i * self.accumulated_integral
 
+        # Derivata con filtro passa-basso
         raw_d = (error - self.prev_error) / dt
         d_filtered = DERIV_FILTER_ALPHA * self.d_prev + (1.0 - DERIV_FILTER_ALPHA) * raw_d
         self.d_prev = d_filtered
         d_term = self.k_d * d_filtered
 
+        # ==============================
+        # Guadagni dinamici in funzione della velocità
+        # ==============================
+        v = self.thrust if self.thrust > 0.5 else 0.5
+        scale = max(0.4, min(1.2, 3.0 / v))
+
+        # Scala che aumenta leggermente con la velocità
+        # A v=0.5, scale = 0.8
+        # A v=3.0, scale = 1.0
+        # A v=5.0, scale = 1.2
+        #scale = 0.7 + (v * 0.1)
+        #scale = max(0.5, min(1.5, scale))  # Clamping di sicurezza
+
+        """predicted_error = error + d_filtered * dt
+        p_term = self.k_p * scale * predicted_error
+        i_term = self.k_i * scale * self.accumulated_integral
+        d_term = self.k_d * scale * d_filtered
+
+        control_output = p_term + i_term + d_term"""
+        predicted_error = error  # Usa l'errore semplice
+
+        p_term = self.k_p * predicted_error  # Rimuovi 'scale'
+        i_term = self.k_i * self.accumulated_integral  # Rimuovi 'scale'
+        d_term = self.k_d * d_filtered  # Rimuovi 'scale'
+
         control_output = p_term + i_term + d_term
 
-        # Saturazione angolare
-        control_output = max(-MAX_ANGULAR, min(MAX_ANGULAR, control_output))
+        # ==============================
+        # Saturazione dinamica dell’angolo
+        # ==============================
+        # ricava velocità (uso thrust se settata)
+        v = self.thrust if self.thrust is not None else 0.0
+        v = max(0.0, float(v))
 
+        # calcola max_ang coerente con velocità e curvatura (aumenta con la velocità,
+        # ma aggiunge anche un termine proporzionale alla curvatura per avere autorità su curve strette)
+        max_ang = 1 + 0.7 * v + 1.2 * abs(self.curv_filtered)
+        max_ang = max(0.5, min(8.0, max_ang))  # clamp di sicurezza
+        control_output = max(-max_ang, min(max_ang, control_output))
+
+        # ==============================
+        # Feedforward di curvatura (filtrato + condizionato)
+        # ==============================
+        # Filtro esponenziale sulla curvatura
+        self.curv_filtered = (self.curv_filter_alpha * self.current_curvature +
+                              (1.0 - self.curv_filter_alpha) * self.curv_filtered)
+
+        curv_abs = abs(self.curv_filtered)
+        v = self.thrust if self.thrust is not None else 0.0
+
+        if curv_abs < self.curv_ff_threshold or v < self.ff_speed_min:
+            curvature_ff = 0.0
+        else:
+            # scaling con la velocità (anticipa di più solo ad alta velocità)
+            speed_scale = (min(v, self.ff_speed_max) - self.ff_speed_min) / max(1e-6,
+                                                                                (self.ff_speed_max - self.ff_speed_min))
+            speed_scale = max(0.0, speed_scale) ** 0.8
+
+            k_ff = self.k_ff_base
+            anticipatory_boost = 1.0  # opzionale: aggiustabile se hai derivata di curvatura
+            curvature_ff = k_ff * self.curv_filtered * speed_scale * anticipatory_boost
+
+        # Clipping del feedforward
+        max_ff = 0.7 * MAX_ANGULAR
+        curvature_ff = max(-max_ff, min(max_ff, curvature_ff))
+
+        control_output += curvature_ff
+
+        # ==============================
         # Logging interno
+        # ==============================
         try:
             elapsed = (self.get_clock().now() - self.time_start).nanoseconds / 1e9
-            self.log_data(elapsed, dt, error, control_output, self.thrust, control_output, p_term, i_term, d_term)
+            self.log_data(
+                elapsed, dt, error, control_output,
+                self.thrust, control_output,
+                p_term, i_term, d_term
+            )
         except Exception:
             pass
 

@@ -6,6 +6,7 @@ from line_tracking.planning_strategies.better_centerline_strategy import BetterC
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Quaternion
 from skimage.morphology import skeletonize
+from sklearn.cluster import DBSCAN
 
 # Helper function to convert quaternions into Euler angles (to extract yaw)
 def euler_from_quaternion(x, y, z, w):
@@ -59,7 +60,7 @@ class ExplorationBasedStrategy:
         self.loop_threshold = 30.0
         self.coverage_threshold = 2000
         self.curvature_gain = 0.5
-        self.lookahead_distance = 500
+        self.lookahead_distance = 800
         self.loop_counter = 0
         self.total_travelled = 0
         self.hold_cycles = 20
@@ -123,7 +124,7 @@ class ExplorationBasedStrategy:
 
         self._update_map(track_outline)
         curvature_camera = self._predict_future_curvature_exploration(centerline)
-        CURVATURE_THRESHOLD = 0.05  # Soglia di importanza
+        """CURVATURE_THRESHOLD = 0.05  # Soglia di importanza
 
         if self.cycles_to_hold > 0:
             # Modality HOLD
@@ -141,14 +142,18 @@ class ExplorationBasedStrategy:
 
         else:
             curvature_to_publish = curvature_camera
+        curvature = curvature_to_publish"""
+        # Rimuoviamo la logica 'hold' che crea valori "stale".
+        # Il control_node ha già un suo filtro esponenziale.
+        curvature_to_publish = curvature_camera
         curvature = curvature_to_publish
         curvature_msg = Float32()
         curvature_msg.data = float(curvature)
         self.curvature_publisher.publish(curvature_msg)
-        curvature_msg = Float32()
+        """curvature_msg = Float32()
         curvature_msg.data = abs(curvature_camera)
         self.curvature_publisher.publish(curvature_msg)
-        err += curvature_camera * self.curvature_gain
+        err += curvature_camera * self.curvature_gain"""
         return float(err) if not np.isnan(err) else 0.0
 
     def _exploitation_step(self, img_msg):
@@ -180,6 +185,8 @@ class ExplorationBasedStrategy:
             self.prev_velocity = v_target
             velocity = v_target
             vel_msg = Float32()
+            velocity = max(velocity, 0.5)  # velocità minima garantita
+
             vel_msg.data = float(velocity)
             self.node.create_publisher(Float32, '/planning/velocity', 10).publish(vel_msg)
             curvature = self._predict_future_curvature_exploitation()
@@ -286,7 +293,27 @@ class ExplorationBasedStrategy:
     def _predict_future_curvature_exploration(self, centerline):
         if centerline is None or len(centerline) < 3:
             return 0.0  # pochi punti, non si può calcolare curvatura
+            # --- INIZIO MODIFICA FONDAMENTALE ---
+            # 1. Trasforma i punti da PIXEL a METRI (coordinate veicolo)
+            #    usando la matrice di trasformazione prospettica M.
+        try:
+            pts_pixels = np.float32(centerline).reshape(-1, 1, 2)
+            pts_vehicle = cv.perspectiveTransform(pts_pixels, self.M)
 
+            # Rimuovi la dimensione '1' extra
+            pts = pts_vehicle.squeeze()
+
+            # Gestisci il caso in cui squeeze() rimuove troppo
+            if pts.ndim == 1:
+                pts = np.array([pts])
+
+            if len(pts) < 3:
+                return 0.0
+
+        except Exception as e:
+            self.node.get_logger().warn(f"Perspective transform failed in curvature calc: {e}")
+            return 0.0
+        # --- FINE MODIFICA FONDAMENTALE ---
         pts = np.array(centerline, dtype=float)
         dx = np.gradient(pts[:, 0])
         dy = np.gradient(pts[:, 1])
@@ -294,7 +321,8 @@ class ExplorationBasedStrategy:
         ddy = np.gradient(dy)
 
         denominator = np.power(dx ** 2 + dy ** 2, 1.5) + 1e-6
-        curvature = np.mean(np.abs((dx * ddy - dy * ddx) / denominator))
+        #curvature = np.mean(np.abs((dx * ddy - dy * ddx) / denominator))
+        curvature = np.mean((dx * ddy - dy * ddx) / denominator)  # <-- np.abs RIMOSSO
 
         return float(curvature)
 
@@ -373,14 +401,37 @@ class ExplorationBasedStrategy:
         # Normalizza la differenza angolare usando il `map_yaw` corretto
         angle_diff = angles_in_map_frame - map_yaw
         angle_diff_normalized = (angle_diff + np.pi) % (2 * np.pi) - np.pi
-        front_mask = np.abs(angle_diff_normalized) > (np.pi / 2)
+        front_mask = np.abs(angle_diff_normalized) > (np.pi / 2) #prima era > e andava, forse pure meglio
         pts_front = pts[front_mask]
 
         if pts_front.shape[0] < 3:
             return 0.0
+        # --- Clusterizzazione per identificare il gruppo più grande ---
+        if pts_front.shape[0] > 0:
+            # eps: distanza massima tra punti per farli appartenere allo stesso cluster
+            # min_samples: minima numerosità per cluster valido
+            clustering = DBSCAN(eps=0.1, min_samples=3).fit(
+                pts_front)  # eps va tarato in base alla scala della mappa (pixel)
+            labels = clustering.labels_
+
+            # Filtra solo i punti che appartengono a un cluster (label != -1)
+            valid_mask = labels != -1
+            if np.any(valid_mask):
+                labels_valid = labels[valid_mask]
+                pts_valid = pts_front[valid_mask]
+
+                # Conta quanti punti per cluster
+                unique_labels, counts = np.unique(labels_valid, return_counts=True)
+                largest_cluster_label = unique_labels[np.argmax(counts)]
+
+                # Mantieni solo il cluster più grande
+                pts_front = pts_valid[labels_valid == largest_cluster_label]
+            else:
+                # Tutti punti outlier: fallback
+                pts_front = np.empty((0, 2))
 
         dists_to_robot = np.linalg.norm(pts_front - robot_pt, axis=1)
-        lookahead_px = int(6.0 / self.map_resolution)
+        lookahead_px = int(3.0 / self.map_resolution)
         num_points_to_take = min(lookahead_px, len(pts_front))
         sorted_indices = np.argsort(dists_to_robot)
         nearest_indices = sorted_indices[:num_points_to_take]
@@ -451,7 +502,7 @@ class ExplorationBasedStrategy:
             self.loop_counter += 1
             self.total_travelled=0
 
-        if self.loop_counter > 0:
+        if self.loop_counter > 1:
             self.node.get_logger().info(f"Loop closure detected after {self.total_travelled:.2f} m.")
             self.hold_cycles = 0
             return True
@@ -480,11 +531,41 @@ class ExplorationBasedStrategy:
         ddx = np.gradient(dx)
         ddy = np.gradient(dy)
         denom = np.power(dx ** 2 + dy ** 2, 1.5) + 1e-6
-        curvature = (dx * ddy - dy * ddx) / denom
+        curvature = np.abs((dx * ddy - dy * ddx) / denom)
 
-        vmax = 4.0
-        k = 10.0
-        velocity_profile = vmax / (1 + k * np.abs(curvature))  # Usa np.abs per la velocità!
+        # 🔹 Smoothing della curvatura
+        window = 15
+        curvature_smooth = np.convolve(curvature, np.ones(window) / window, mode='same')
+
+        # 🔹 Clipping: evita valori fuori scala
+        curvature_smooth = np.clip(curvature_smooth, 0.0, 0.5)
+
+        # 🔹 Profilo di velocità fisicamente più realistico
+        vmax = 8.0  # velocità massima in rettilineo
+        a_lat_max = 3.0  # accelerazione laterale massima ammessa (m/s²)
+
+        # Calcola velocità ammissibile per ogni curvatura: v = sqrt(a_lat_max / curv)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            v_safe = np.sqrt(a_lat_max / np.maximum(curvature_smooth, 1e-4))
+
+        # Applica limite massimo e minimo
+        v_safe = np.clip(v_safe, 3.0, vmax)
+
+        # 🔹 Leggera attenuazione aggiuntiva per sicurezza globale
+        velocity_profile = 0.9 * v_safe
+        # 🔹 Lookahead smoothing: anticipa le curve di N punti (~2-3 metri)
+        lookahead = 50  # se la discretizzazione è 0.05 m/pt, ~2.5 m
+        curvature_future = np.copy(curvature_smooth)
+        for i in range(len(curvature_smooth) - lookahead):
+            curvature_future[i] = np.max(curvature_smooth[i:i + lookahead])
+        curvature_future[-lookahead:] = curvature_smooth[-lookahead:]
+
+        # 🔹 Ricalcola velocità in base alla curvatura futura
+        a_lat_max = 6.0  # m/s²
+        v_safe = np.sqrt(a_lat_max / np.maximum(curvature_future, 1e-4))
+        v_safe = np.clip(v_safe, 2.5, 8.0)
+        velocity_profile = 0.9 * v_safe
+        velocity_profile = np.convolve(velocity_profile, np.ones(10) / 10, mode='same')
 
         # 4. Salva il profilo con coordinate in METRI
         #    (la x è pts[i, 0], la y è pts[i, 1])

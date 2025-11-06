@@ -119,7 +119,7 @@ class BetterCenterlineStrategy:
         # Compute centerline between the track boundaries
         centerline = self.compute_centerline(left_limit, right_limit)
         # compute the curvature
-        current_curvature= self.calculate_point_ratio_curvature(left_limit, right_limit)
+        """current_curvature= self.calculate_point_ratio_curvature(left_limit, right_limit)
         CURVATURE_THRESHOLD = 0.10
         if self.cycles_to_hold > 0:
             # Modality HOLD: we use the previous curvature value
@@ -141,7 +141,7 @@ class BetterCenterlineStrategy:
         curvature = curvature_to_publish
         curvature_msg = Float32()
         curvature_msg.data = float(curvature)
-        self.curvature_publisher.publish(curvature_msg)
+        self.curvature_publisher.publish(curvature_msg)"""
 
         # Convert the grayscale image to RGB for visualization
         vis_img = cv.cvtColor(cropped_outline, cv.COLOR_GRAY2BGR)
@@ -174,13 +174,13 @@ class BetterCenterlineStrategy:
         self.prev_waypoint = waypoint
         self.prev_offset = waypoint_offset
         # Compute navigation error based on configured error type
-        if self.error_type == ErrorType.OFFSET:
-            err, offset = self.compute_offset_error(waypoint, crosshair, cr_width / 2)
-        elif self.error_type == ErrorType.ANGLE:
-            err, angle = self.compute_angle_error(waypoint, position)
-        else:
-            self.node.get_logger().error(f"Unknown error type. Exiting")
-            rclpy.shutdown()
+        #if self.error_type == ErrorType.OFFSET:
+        #    err, offset = self.compute_offset_error(waypoint, crosshair, cr_width / 2)
+        #elif self.error_type == ErrorType.ANGLE:
+        err, angle = self.compute_angle_error(waypoint, position)
+        #else:
+        #    self.node.get_logger().error(f"Unknown error type. Exiting")
+        #    rclpy.shutdown()
         # Generate debug visualization if enabled
         if self.viz is not None:
             # Build base visualization showing track and centerline
