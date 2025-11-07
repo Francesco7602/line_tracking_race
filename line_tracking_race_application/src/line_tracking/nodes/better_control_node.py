@@ -26,7 +26,7 @@ MAX_THRUST = 3.0       # m/s - velocità lineare massima
 MAX_ANGULAR = 2.0      # rad/s - limite massimo angolare
 RAMP_UP = 0.5          # incremento thrust per ciclo
 I_MAX = 5.0            # limite integrale assoluto
-DERIV_FILTER_ALPHA = 0.95  # coefficiente filtro derivata (0..1)
+DERIV_FILTER_ALPHA = 0.2#0.95  # coefficiente filtro derivata (0..1)
 
 class BetterControlNode(Node):
     def __init__(self):
@@ -56,9 +56,9 @@ class BetterControlNode(Node):
 
     def _get_parameters(self):
         self.max_duration = self.get_parameter("duration").get_parameter_value().double_value
-        self.k_p = 3.0#self.get_parameter("k_p").get_parameter_value().double_value
-        self.k_i = 0.0#self.get_parameter("k_i").get_parameter_value().double_value
-        self.k_d = 1.2#self.get_parameter("k_d").get_parameter_value().double_value
+        self.k_p = 9.0#self.get_parameter("k_p").get_parameter_value().double_value
+        self.k_i = 0.01#self.get_parameter("k_i").get_parameter_value().double_value
+        self.k_d = 4.0#self.get_parameter("k_d").get_parameter_value().double_value
 
     # ==========================================================
     #  Setup logging
@@ -199,10 +199,11 @@ class BetterControlNode(Node):
         error = msg.data
         self.errors.append(error)
         time_now = self.get_clock().now()
-        self.times.append(time_now.nanoseconds / 1e9)
+        #self.times.append(time_now.nanoseconds / 1e9)
 
         # Inizializzazione temporale
         if not self.started:
+            self.times.append(0)
             self.time_start = time_now
             self.time_prev = time_now
             self.started = True
@@ -210,6 +211,7 @@ class BetterControlNode(Node):
             return
 
         elapsed = (time_now - self.time_start).nanoseconds / 1e9
+        self.times.append(elapsed)
         dt = (time_now - self.time_prev).nanoseconds / 1e9
         if dt <= 0.0:
             return

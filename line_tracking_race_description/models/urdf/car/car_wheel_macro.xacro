@@ -38,8 +38,8 @@
             <material>Gazebo/DarkGrey</material>
             <mu1 value="${p.WHEEL_MU1}" />
             <mu2 value="${p.WHEEL_MU2}" />
-            <kp value="${props.WHEEL_KD}" />
-            <kd value="${props.WHEEL_KP}" />
+            <kp value="${props.WHEEL_KP}" />
+            <kd value="${props.WHEEL_KD}" />
         </gazebo>
 
     </xacro:macro>
