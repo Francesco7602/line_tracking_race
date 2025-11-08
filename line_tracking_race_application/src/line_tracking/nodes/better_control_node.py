@@ -26,7 +26,7 @@ MAX_THRUST = 3.0       # m/s - velocità lineare massima
 MAX_ANGULAR = 2.0      # rad/s - limite massimo angolare
 RAMP_UP = 0.5          # incremento thrust per ciclo
 I_MAX = 5.0            # limite integrale assoluto
-DERIV_FILTER_ALPHA = 0.2#0.95  # coefficiente filtro derivata (0..1)
+DERIV_FILTER_ALPHA = 0.95#0.95  # coefficiente filtro derivata (0..1)
 
 class BetterControlNode(Node):
     def __init__(self):
@@ -56,9 +56,9 @@ class BetterControlNode(Node):
 
     def _get_parameters(self):
         self.max_duration = self.get_parameter("duration").get_parameter_value().double_value
-        self.k_p = 9.0#self.get_parameter("k_p").get_parameter_value().double_value
-        self.k_i = 0.01#self.get_parameter("k_i").get_parameter_value().double_value
-        self.k_d = 4.0#self.get_parameter("k_d").get_parameter_value().double_value
+        self.k_p = 7.5#self.get_parameter("k_p").get_parameter_value().double_value
+        self.k_i = 0.0#self.get_parameter("k_i").get_parameter_value().double_value
+        self.k_d = 2.5#self.get_parameter("k_d").get_parameter_value().double_value
 
     # ==========================================================
     #  Setup logging
@@ -86,7 +86,7 @@ class BetterControlNode(Node):
         self.curv_filtered = 0.0
         self.curv_filter_alpha = 0.2  # 0..1, piccolo = più smoothing
         # parametri feedforward
-        self.k_ff_base = 1.0#2.8  # valore iniziale consigliato (prova 0.15-0.6)
+        self.k_ff_base = 0.0#2.8  # valore iniziale consigliato (prova 0.15-0.6)
         self.curv_ff_threshold = 0.0  # soglia sotto cui non anticipare
         self.ff_speed_min = 0.2  # velocità minima per applicare feedforward
         self.ff_speed_max = 8.0  # velocità massima per scaling
@@ -98,10 +98,28 @@ class BetterControlNode(Node):
         self.velocity_sub = self.create_subscription(Float32, "/planning/velocity", self.handle_velocity_callback, 10)
         self.current_curvature = 0.0
         self.target_velocity = None
+        # dentro __init__() o _setup_ros_communication()
+        self.mode_sub = self.create_subscription(Float32, "/planner/mode", self.handle_mode_callback, 10)
+        self.base_gains = {"kp": 7.5, "ki": 0.0, "kd": 2.5}  # valori di riferimento
+        self.mode_gain_map = {
+            0.0: {"kp": 7.5, "ki": 0.0, "kd": 2.5},  # exploration
+            1.0: {"kp": 12.0, "ki": 0.0, "kd": 4.5}  # exploitation (start qui)
+        }
+        self.v_nominal = 2.5  # per scaling dinamico
 
     # ==========================================================
     #  Callback principali
     # ==========================================================
+    def handle_mode_callback(self, msg):
+        mode = float(msg.data)
+        if mode not in (0.0, 1.0):
+            return
+        g = self.mode_gain_map.get(mode, self.base_gains)
+        self.k_p = g["kp"]
+        self.k_i = g["ki"]
+        self.k_d = g["kd"]
+        self.get_logger().info(f"Mode {mode} -> Gains set: P={self.k_p}, I={self.k_i}, D={self.k_d}")
+
     def handle_curvature_callback(self, msg):
         self.current_curvature = msg.data
 
@@ -269,42 +287,19 @@ class BetterControlNode(Node):
 
         self.accumulated_integral = max(-I_MAX, min(I_MAX, self.accumulated_integral))
 
-        # ==============================
-        # Calcolo termini PID
-        # ==============================
-        p_term = self.k_p * error
-        i_term = self.k_i * self.accumulated_integral
-
-        # Derivata con filtro passa-basso
         raw_d = (error - self.prev_error) / dt
         d_filtered = DERIV_FILTER_ALPHA * self.d_prev + (1.0 - DERIV_FILTER_ALPHA) * raw_d
-        self.d_prev = d_filtered
-        d_term = self.k_d * d_filtered
-
-        # ==============================
-        # Guadagni dinamici in funzione della velocità
-        # ==============================
+        predicted_error = error  # Usa l'errore semplice
         v = self.thrust if self.thrust > 0.5 else 0.5
-        scale = max(0.4, min(1.2, 3.0 / v))
-
-        # Scala che aumenta leggermente con la velocità
-        # A v=0.5, scale = 0.8
-        # A v=3.0, scale = 1.0
-        # A v=5.0, scale = 1.2
-        #scale = 0.7 + (v * 0.1)
-        #scale = max(0.5, min(1.5, scale))  # Clamping di sicurezza
-
-        """predicted_error = error + d_filtered * dt
+        V_NOMINAL = 2.5
+        # Scala solo se sei SOTTO la velocità nominale
+        if v > V_NOMINAL:
+            scale = V_NOMINAL / v  # Es: v=1.25 -> scale=0.5 (meno reattivo)
+        else:
+            scale = 1.0  # Usa i guadagni pieni (P=5.5, D=0.5)
         p_term = self.k_p * scale * predicted_error
         i_term = self.k_i * scale * self.accumulated_integral
         d_term = self.k_d * scale * d_filtered
-
-        control_output = p_term + i_term + d_term"""
-        predicted_error = error  # Usa l'errore semplice
-
-        p_term = self.k_p * predicted_error  # Rimuovi 'scale'
-        i_term = self.k_i * self.accumulated_integral  # Rimuovi 'scale'
-        d_term = self.k_d * d_filtered  # Rimuovi 'scale'
 
         control_output = p_term + i_term + d_term
 
@@ -369,11 +364,29 @@ class BetterControlNode(Node):
     # ==========================================================
     def _update_thrust(self):
         if self.target_velocity is not None:
-            self.thrust = self.target_velocity
+            # Insegui il target_velocity usando RAMP_UP
+            if self.thrust < self.target_velocity:
+                self.thrust += RAMP_UP
+                self.thrust = min(self.thrust, self.target_velocity)
+            elif self.thrust > self.target_velocity:
+                # Aggiungi un RAMP_DOWN se vuoi frenare gradualmente
+                RAMP_DOWN = RAMP_UP  # o un valore diverso
+                self.thrust -= RAMP_DOWN
+                self.thrust = max(self.thrust, self.target_velocity)
         else:
-            curvature = max(min(self.current_curvature, 1.0), -1.0)
-            speed_factor = max(0.0, 1.0 - (abs(curvature) * 3.0))
-            target_thrust = max(0.0, MAX_THRUST * speed_factor)
+            MIN_SPEED_FACTOR = 0.75
+            # Riduci la sensibilità alla curvatura (3.0 era troppo aggressivo)
+            CURVATURE_SENSITIVITY = 2.0
+
+            curvature = max(min(self.current_curvature, 1.0), -1.0)  #
+            # Calcola la riduzione, ma non scendere mai sotto MIN_SPEED_FACTOR
+            reduction = abs(curvature) * CURVATURE_SENSITIVITY
+            speed_factor = max(MIN_SPEED_FACTOR, 1.0 - reduction)
+
+            # QUESTA ERA LA RIGA PROBLEMATICA:
+            # speed_factor = max(0.0, 1.0 - (abs(curvature) * 3.0))
+
+            target_thrust = max(0.0, MAX_THRUST * speed_factor)  #
 
             if self.thrust < target_thrust:
                 self.thrust += RAMP_UP

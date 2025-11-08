@@ -313,8 +313,7 @@ class ExplorationBasedStrategy:
         except Exception as e:
             self.node.get_logger().warn(f"Perspective transform failed in curvature calc: {e}")
             return 0.0
-        # --- FINE MODIFICA FONDAMENTALE ---
-        pts = np.array(centerline, dtype=float)
+        #pts = np.array(centerline, dtype=float)
         dx = np.gradient(pts[:, 0])
         dy = np.gradient(pts[:, 1])
         ddx = np.gradient(dx)
@@ -502,7 +501,7 @@ class ExplorationBasedStrategy:
             self.loop_counter += 1
             self.total_travelled=0
 
-        if self.loop_counter > 1:
+        if self.loop_counter > 0:
             self.node.get_logger().info(f"Loop closure detected after {self.total_travelled:.2f} m.")
             self.hold_cycles = 0
             return True
@@ -541,7 +540,7 @@ class ExplorationBasedStrategy:
         curvature_smooth = np.clip(curvature_smooth, 0.0, 0.5)
 
         # 🔹 Profilo di velocità fisicamente più realistico
-        vmax = 8.0  # velocità massima in rettilineo
+        vmax = 5.0  # velocità massima in rettilineo
         a_lat_max = 3.0  # accelerazione laterale massima ammessa (m/s²)
 
         # Calcola velocità ammissibile per ogni curvatura: v = sqrt(a_lat_max / curv)
@@ -554,14 +553,14 @@ class ExplorationBasedStrategy:
         # 🔹 Leggera attenuazione aggiuntiva per sicurezza globale
         velocity_profile = 0.9 * v_safe
         # 🔹 Lookahead smoothing: anticipa le curve di N punti (~2-3 metri)
-        lookahead = 50  # se la discretizzazione è 0.05 m/pt, ~2.5 m
+        lookahead = 200  # 250 sembra ok, solo va troppo lento 200 SEMBRA PERFETT
         curvature_future = np.copy(curvature_smooth)
         for i in range(len(curvature_smooth) - lookahead):
             curvature_future[i] = np.max(curvature_smooth[i:i + lookahead])
         curvature_future[-lookahead:] = curvature_smooth[-lookahead:]
 
         # 🔹 Ricalcola velocità in base alla curvatura futura
-        a_lat_max = 6.0  # m/s²
+        a_lat_max = 3.0  # m/s²
         v_safe = np.sqrt(a_lat_max / np.maximum(curvature_future, 1e-4))
         v_safe = np.clip(v_safe, 2.5, 8.0)
         velocity_profile = 0.9 * v_safe
