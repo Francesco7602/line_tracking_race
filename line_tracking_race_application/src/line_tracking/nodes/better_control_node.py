@@ -1,19 +1,8 @@
-"""
-ROS2 PID Control Node for Line Tracking Robot (Stabilized Version)
----------------------------------------------------------------
-Versione migliorata con:
-- Anti-windup per termine integrale
-- Filtro derivata (low-pass)
-- Saturazione output (angular e thrust)
-- Inizializzazione corretta di prev_error
-- Protezione da dt instabili
-- Log completo e stabile
-"""
-
 import os
 import csv
 from datetime import datetime
 import matplotlib.pyplot as plt
+import math
 
 import rclpy
 from rclpy.node import Node
@@ -21,48 +10,50 @@ from std_msgs.msg import Float32
 from geometry_msgs.msg import Twist
 from ament_index_python.packages import get_package_share_directory
 
-# === Costanti di controllo ===
 MAX_THRUST = 3.0       # m/s - velocità lineare massima
 MAX_ANGULAR = 2.0      # rad/s - limite massimo angolare
 RAMP_UP = 0.5          # incremento thrust per ciclo
 I_MAX = 5.0            # limite integrale assoluto
-DERIV_FILTER_ALPHA = 0.95#0.95  # coefficiente filtro derivata (0..1)
+DERIV_FILTER_ALPHA = 0.95       # coefficiente filtro derivata (0..1)
+
+"""
+Implementation of an advanced control node for autonomous racing.
+Provides sophisticated control algorithms with adaptive gains and
+performance monitoring capabilities.
+"""
 
 class BetterControlNode(Node):
+    """
+    Enhanced implementation of control node with advanced features:
+    - Adaptive PID control
+    - Performance monitoring and logging
+    - Multiple control modes support
+    """
     def __init__(self):
         super().__init__('control_node')
-
         # --- Parametri ROS2 ---
         self._declare_parameters()
         self._get_parameters()
-
         self.get_logger().info(f"PID params: P={self.k_p}, I={self.k_i}, D={self.k_d}")
-
         # --- Logging e stato PID ---
         self._setup_logging()
         self._initialize_control_variables()
         self._setup_ros_communication()
-
         self.get_logger().info("Control node initialized successfully!")
 
-    # ==========================================================
-    #  Dichiarazione parametri
-    # ==========================================================
+
     def _declare_parameters(self):
         self.declare_parameter("duration", -1.0)
-        self.declare_parameter("k_p", 0.0)  # Leggermente ridotto per meno aggressività, prima 0.06
-        self.declare_parameter("k_i", 0.0)  # prima 0.005Drasticamente ridotto per fermare le oscillazioni
-        self.declare_parameter("k_d", 0.0) #prima 0.2
+        self.declare_parameter("k_p", 0.0)
+        self.declare_parameter("k_i", 0.0)
+        self.declare_parameter("k_d", 0.0)
 
     def _get_parameters(self):
         self.max_duration = self.get_parameter("duration").get_parameter_value().double_value
-        self.k_p = 7.5#self.get_parameter("k_p").get_parameter_value().double_value
-        self.k_i = 0.0#self.get_parameter("k_i").get_parameter_value().double_value
-        self.k_d = 2.5#self.get_parameter("k_d").get_parameter_value().double_value
+        self.k_p = 7.5
+        self.k_i = 0.0
+        self.k_d = 2.5
 
-    # ==========================================================
-    #  Setup logging
-    # ==========================================================
     def _setup_logging(self):
         date = datetime.today().strftime("%Y-%m-%d_%H-%M-%S")
         self.pkg_path = get_package_share_directory("line_tracking_race_application")
@@ -72,7 +63,6 @@ class BetterControlNode(Node):
         self.times = []
 
     def _initialize_control_variables(self):
-        self.setpoint = 0.0
         self.prev_error = 0.0
         self.accumulated_integral = 0.0
         self.thrust = 0.0
@@ -82,11 +72,14 @@ class BetterControlNode(Node):
         self.time_prev = None
         self.d_prev = 0.0
         self._pid_initialized = False
-        # smoothing per curvatura (low-pass esponenziale)
+        self.errors = []  # Lista per errore di controllo
+        self.times_errors = []  # Timestamp per errore di controllo
+        self.positional_errors = []  # Lista per errore di posizione
+        self.times_positional = []
         self.curv_filtered = 0.0
         self.curv_filter_alpha = 0.2  # 0..1, piccolo = più smoothing
         # parametri feedforward
-        self.k_ff_base = 0.0#2.8  # valore iniziale consigliato (prova 0.15-0.6)
+        self.k_ff_base = 0.0
         self.curv_ff_threshold = 0.0  # soglia sotto cui non anticipare
         self.ff_speed_min = 0.2  # velocità minima per applicare feedforward
         self.ff_speed_max = 8.0  # velocità massima per scaling
@@ -96,20 +89,18 @@ class BetterControlNode(Node):
         self.error_sub = self.create_subscription(Float32, "/planning/error", self.handle_error_callback, 10)
         self.curvature_sub = self.create_subscription(Float32, "/planning/curvature", self.handle_curvature_callback, 10)
         self.velocity_sub = self.create_subscription(Float32, "/planning/velocity", self.handle_velocity_callback, 10)
+        self.pos_error_sub = self.create_subscription(Float32, "/planning/positional_error",
+                                                      self.handle_positional_error_callback, 10)
         self.current_curvature = 0.0
         self.target_velocity = None
-        # dentro __init__() o _setup_ros_communication()
         self.mode_sub = self.create_subscription(Float32, "/planner/mode", self.handle_mode_callback, 10)
         self.base_gains = {"kp": 7.5, "ki": 0.0, "kd": 2.5}  # valori di riferimento
         self.mode_gain_map = {
             0.0: {"kp": 7.5, "ki": 0.0, "kd": 2.5},  # exploration
-            1.0: {"kp": 12.0, "ki": 0.0, "kd": 4.5}  # exploitation (start qui)
+            1.0: {"kp": 12.0, "ki": 0.0, "kd": 4.5}  # exploitation
         }
         self.v_nominal = 2.5  # per scaling dinamico
 
-    # ==========================================================
-    #  Callback principali
-    # ==========================================================
     def handle_mode_callback(self, msg):
         mode = float(msg.data)
         if mode not in (0.0, 1.0):
@@ -123,43 +114,45 @@ class BetterControlNode(Node):
     def handle_curvature_callback(self, msg):
         self.current_curvature = msg.data
 
+    def handle_positional_error_callback(self, msg):
+        self.current_positional_error = msg.data
+        # Se il timer non è partito, fallo partire
+        if self.time_start is None:
+            # Non possiamo ancora registrare il tempo se il timer principale
+            # (in handle_error_callback) non è partito.
+            if not self.started:
+                 return
+            self.time_start = self.get_clock().now()
+        # Aggiungi i dati alle liste apposite
+        elapsed = (self.get_clock().now() - self.time_start).nanoseconds / 1e9
+        self.positional_errors.append(self.current_positional_error)
+        self.times_positional.append(elapsed)
+
     def handle_velocity_callback(self, msg):
         self.target_velocity = msg.data
         self.get_logger().info(f"Received target velocity: {self.target_velocity:.2f} m/s")
 
     def _apply_saturation_and_publish(self, linear_x, angular_z):
         """
-        Applica saturazioni soft e publish dei comandi.
-        - linear_x: comando lineare calcolato dal controller (m/s o unità usate)
-        - angular_z: comando angolare grezzo calcolato dal controller (rad/s o unità usate)
-
-        NOTE:
-        - Usa soft-saturation (tanh) per evitare cut bruschi.
-        - Riduce la velocità in funzione dell'entità della sterzata richiesta.
-        - Parametri tunable sotto: MODIFICARE a piacere e loggare i risultati.
+        Apply limits to control output and publish command.
+        
+        Args:
+            control_output: Raw control value from controller
+            
+        Ensures control outputs stay within safe limits and handles
+        command publication to actuators.
         """
-
-        import math
-        # ----------------------------
-        # Parametri tunabili (modifica per il tuo veicolo/simulatore)
         MIN_ANG = 3.5  # saturazione angolare minima (rad/s) ai bassi regimi
         ANG_SLOPE = 0.6  # pendenza: quanto aumenta max_ang al crescere della velocità
         ANG_OFFSET = 3.0  # offset addizionale
         MAX_ANG_LIMIT = 10.0  # limite superiore assoluto (protezione)
-        MAX_THRUST = getattr(self, "MAX_THRUST", 3.0)  # valore presente nel tuo codice
-        # quanto ridurre la velocità in curva (0.0 = non ridurre, 1.0 = riduzione massima)
-        MAX_SPEED_REDUCTION_RATIO = 0.30  # fino al 50% di riduzione in curva
-        # soglia di "saturazione percepita" per logging/anti-windup
+        MAX_THRUST = getattr(self, "MAX_THRUST", 3.0)
+        MAX_SPEED_REDUCTION_RATIO = 0.30
         SATURATION_WARN_RATIO = 0.95
-        # ----------------------------
-
-        # ricava la velocità corrente (usa self.thrust se presente, altrimenti target)
         v = getattr(self, "thrust", None)
         if v is None:
             v = getattr(self, "target_velocity", 0.0)
-        # garantisci valore non nullo per le formule
         v = float(max(0.0, v))
-
         # calcola max angolare dinamico (monotonicamente crescente con v)
         max_ang = ANG_SLOPE * v + ANG_OFFSET
         if max_ang < MIN_ANG:
@@ -176,31 +169,24 @@ class BetterControlNode(Node):
         else:
             angular_z_saturated = angular_z
 
-        # --- riduzione della velocità in curva (velocity shaping) ---
+        # --- riduzione della velocità in curva ---
         # più è alta la frazione |angular|/max_ang, più riduciamo linear_x (fino a MAX_SPEED_REDUCTION_RATIO)
         turn_aggressiveness = min(1.0, abs(angular_z_saturated) / (max_ang + 1e-6))
         speed_reduction_factor = 1.0 - MAX_SPEED_REDUCTION_RATIO * turn_aggressiveness
         linear_x_after = max(0.0, linear_x) * speed_reduction_factor
-        # --- anti-windup (semplice, non invasivo) ---
+        # --- anti-windup ---
         # segnala al PID se siamo in saturazione così puoi decidere di frenare l'integrale.
         saturated_ang = abs(angular_z_saturated) >= (SATURATION_WARN_RATIO * max_ang)
         saturated_lin = linear_x_after >= (SATURATION_WARN_RATIO * MAX_THRUST)
-        # se hai un metodo PID con anti-windup, chiamalo qui; altrimenti puoi ridurre l'integrale manualmente:
         if saturated_ang or saturated_lin:
-            # esempio non invasivo: scala leggermente integrale se esiste
+            #scala leggermente integrale se esiste
             pid = getattr(self, "pid", None)
             if pid is not None and hasattr(pid, "integral"):
-                # riduce l'integrale del 10% per evitare accumulo se saturati (tweak a piacere)
                 try:
                     pid.integral *= 0.9
                 except Exception:
                     pass
-
-        # --- publish ---
-        # finalmente pubblica i comandi
         self.publish_cmd_vel(linear_x_after, angular_z_saturated)
-
-        # --- logging utile per debug (sostituisci print con il tuo logger) ---
         debug_line = {
             "v": v,
             "requested_linear": linear_x,
@@ -214,22 +200,32 @@ class BetterControlNode(Node):
         }
         self.get_logger().info(f"Control loop: {debug_line}")
     def handle_error_callback(self, msg):
+        """
+        Process new error measurements for control computation.
+        
+        Args:
+            msg: Error message containing latest measurement
+            
+        Updates control state and triggers new control computation.
+        """
         error = msg.data
-        self.errors.append(error)
         time_now = self.get_clock().now()
-        #self.times.append(time_now.nanoseconds / 1e9)
 
         # Inizializzazione temporale
         if not self.started:
-            self.times.append(0)
             self.time_start = time_now
             self.time_prev = time_now
             self.started = True
             self.prev_error = error
+
+            self.times_errors.append(0.0)
+            self.errors.append(error)
             return
 
         elapsed = (time_now - self.time_start).nanoseconds / 1e9
-        self.times.append(elapsed)
+        self.times_errors.append(elapsed)  # Aggiungi il tempo per l'errore di controllo
+        self.errors.append(error)  # Aggiungi l'errore di controllo
+
         dt = (time_now - self.time_prev).nanoseconds / 1e9
         if dt <= 0.0:
             return
@@ -250,103 +246,79 @@ class BetterControlNode(Node):
 
         linear_x = self.thrust
         angular_z = control_output
-
-        # Saturazione finale (sicurezza)
-        dynamic_global_max = max(2.0, 0.5 * self.thrust + 2.0)  # esempio
-        #angular_z = max(-dynamic_global_max, min(dynamic_global_max, angular_z))
-        #angular_z = max(-MAX_ANGULAR, min(MAX_ANGULAR, angular_z))
-        linear_x = max(0.0, linear_x)#min(MAX_THRUST, linear_x))
-
+        linear_x = max(0.0, linear_x)
         self._apply_saturation_and_publish(linear_x, angular_z)
 
-    # ==========================================================
-    #  Calcolo PID
-    # ==========================================================
     def _update_performance_metrics(self, error, dt):
+        """
+        Update tracking performance statistics.
+        
+        Computes and logs various performance metrics including:
+        - Integral Square Error (ISE)
+        - Settling time
+        - Overshoot
+        """
         self.ISE += dt * (error**2 + self.prev_error**2) / 2.0
 
     def _calculate_pid_control(self, error, dt):
-        # ==============================
-        # Inizializzazione primo ciclo
-        # ==============================
+        """
+        Calculate PID control output based on current error.
+        
+        Args:
+            error: Current tracking error value
+            dt: Time delta since last update
+            
+        Returns:
+            float: Computed control output
+            
+        Implements PID control with anti-windup and derivative filtering.
+        """
         if not self._pid_initialized:
             self.prev_error = error
             self._pid_initialized = True
-
-        # ==============================
-        # Integrale con anti-windup
-        # ==============================
         if self.target_velocity is not None:
             if abs(error) < 0.2 and self.target_velocity < 5.0:
                 self.accumulated_integral += 0.5 * (error + self.prev_error) * dt
             else:
-                # scarica lentamente l’integratore per evitare accumulo in manovre brusche
                 self.accumulated_integral *= 0.9
         else:
             self.accumulated_integral += 0.5 * (error + self.prev_error) * dt
-
         self.accumulated_integral = max(-I_MAX, min(I_MAX, self.accumulated_integral))
-
         raw_d = (error - self.prev_error) / dt
         d_filtered = DERIV_FILTER_ALPHA * self.d_prev + (1.0 - DERIV_FILTER_ALPHA) * raw_d
-        predicted_error = error  # Usa l'errore semplice
+        predicted_error = error
         v = self.thrust if self.thrust > 0.5 else 0.5
         V_NOMINAL = 2.5
-        # Scala solo se sei SOTTO la velocità nominale
         if v > V_NOMINAL:
-            scale = V_NOMINAL / v  # Es: v=1.25 -> scale=0.5 (meno reattivo)
+            scale = V_NOMINAL / v
         else:
-            scale = 1.0  # Usa i guadagni pieni (P=5.5, D=0.5)
+            scale = 1.0
         p_term = self.k_p * scale * predicted_error
         i_term = self.k_i * scale * self.accumulated_integral
         d_term = self.k_d * scale * d_filtered
-
         control_output = p_term + i_term + d_term
-
-        # ==============================
-        # Saturazione dinamica dell’angolo
-        # ==============================
-        # ricava velocità (uso thrust se settata)
         v = self.thrust if self.thrust is not None else 0.0
         v = max(0.0, float(v))
-
-        # calcola max_ang coerente con velocità e curvatura (aumenta con la velocità,
-        # ma aggiunge anche un termine proporzionale alla curvatura per avere autorità su curve strette)
         max_ang = 1 + 0.7 * v + 1.2 * abs(self.curv_filtered)
         max_ang = max(0.5, min(8.0, max_ang))  # clamp di sicurezza
         control_output = max(-max_ang, min(max_ang, control_output))
-
-        # ==============================
-        # Feedforward di curvatura (filtrato + condizionato)
-        # ==============================
-        # Filtro esponenziale sulla curvatura
         self.curv_filtered = (self.curv_filter_alpha * self.current_curvature +
                               (1.0 - self.curv_filter_alpha) * self.curv_filtered)
-
         curv_abs = abs(self.curv_filtered)
-        v = self.thrust if self.thrust is not None else 0.0
-
         if curv_abs < self.curv_ff_threshold or v < self.ff_speed_min:
             curvature_ff = 0.0
         else:
-            # scaling con la velocità (anticipa di più solo ad alta velocità)
             speed_scale = (min(v, self.ff_speed_max) - self.ff_speed_min) / max(1e-6,
                                                                                 (self.ff_speed_max - self.ff_speed_min))
             speed_scale = max(0.0, speed_scale) ** 0.8
-
             k_ff = self.k_ff_base
-            anticipatory_boost = 1.0  # opzionale: aggiustabile se hai derivata di curvatura
+            anticipatory_boost = 1.0
             curvature_ff = k_ff * self.curv_filtered * speed_scale * anticipatory_boost
 
         # Clipping del feedforward
         max_ff = 0.7 * MAX_ANGULAR
         curvature_ff = max(-max_ff, min(max_ff, curvature_ff))
-
         control_output += curvature_ff
-
-        # ==============================
-        # Logging interno
-        # ==============================
         try:
             elapsed = (self.get_clock().now() - self.time_start).nanoseconds / 1e9
             self.log_data(
@@ -359,35 +331,22 @@ class BetterControlNode(Node):
 
         return control_output
 
-    # ==========================================================
-    #  Gestione velocità e comandi
-    # ==========================================================
     def _update_thrust(self):
         if self.target_velocity is not None:
-            # Insegui il target_velocity usando RAMP_UP
             if self.thrust < self.target_velocity:
                 self.thrust += RAMP_UP
                 self.thrust = min(self.thrust, self.target_velocity)
             elif self.thrust > self.target_velocity:
-                # Aggiungi un RAMP_DOWN se vuoi frenare gradualmente
-                RAMP_DOWN = RAMP_UP  # o un valore diverso
+                RAMP_DOWN = RAMP_UP
                 self.thrust -= RAMP_DOWN
                 self.thrust = max(self.thrust, self.target_velocity)
         else:
             MIN_SPEED_FACTOR = 0.75
-            # Riduci la sensibilità alla curvatura (3.0 era troppo aggressivo)
             CURVATURE_SENSITIVITY = 2.0
-
             curvature = max(min(self.current_curvature, 1.0), -1.0)  #
-            # Calcola la riduzione, ma non scendere mai sotto MIN_SPEED_FACTOR
             reduction = abs(curvature) * CURVATURE_SENSITIVITY
             speed_factor = max(MIN_SPEED_FACTOR, 1.0 - reduction)
-
-            # QUESTA ERA LA RIGA PROBLEMATICA:
-            # speed_factor = max(0.0, 1.0 - (abs(curvature) * 3.0))
-
-            target_thrust = max(0.0, MAX_THRUST * speed_factor)  #
-
+            target_thrust = max(0.0, MAX_THRUST * speed_factor)
             if self.thrust < target_thrust:
                 self.thrust += RAMP_UP
                 self.thrust = min(self.thrust, target_thrust)
@@ -401,9 +360,6 @@ class BetterControlNode(Node):
         twist_msg.angular.z = angular_z
         self.cmd_vel.publish(twist_msg)
 
-    # ==========================================================
-    #  Logging CSV e grafici
-    # ==========================================================
     def open_logfile(self, date):
         pid_params = f"{self.k_p}-{self.k_i}-{self.k_d}".replace(".", ",")
         log_dir = os.path.join(self.pkg_path, "logs")
@@ -426,40 +382,66 @@ class BetterControlNode(Node):
         self.log_writer.writerow([elapsed, dt, error, control, linear_x, angular_z, p_term, i_term, d_term])
 
     def log_performance_indices(self):
+        """
+        Log computed performance metrics to file.
+        
+        Records various performance indicators for later analysis
+        and performance evaluation.
+        """
         self.performance_index_writer.writerow([self.ISE])
 
     def plot_error(self):
-        plt.figure()
-        plt.plot(self.times, self.errors, label="Tracking Error")
-        plt.xlabel("Time (s)")
-        plt.ylabel("Error")
-        plt.title("Error Over Time")
+        plt.figure(figsize=(20, 10))
+        if not self.times_errors or not self.errors:
+            self.get_logger().warn("Nessun dato per 'Errore di Controllo' da plottare.")
+            return
+        if not self.times_positional or not self.positional_errors:
+            self.get_logger().warn("Nessun dato per 'Errore di Posizione' da plottare.")
+            return
+        plt.plot(self.times_errors, self.errors, label="Errore di Controllo (per Waypoint futuro)", alpha=0.9,
+                 linewidth=2)
+        plt.plot(self.times_positional, self.positional_errors, label="Errore di Posizione (Attuale)", linestyle='--',
+                 color='red',
+                 alpha=0.8, linewidth=2)
+        plt.xlabel("Tempo (s)")
+        plt.ylabel("Errore")
+        plt.title("Confronto Errori nel Tempo")
         plt.grid(True)
         plt.legend()
+        try:
+            all_errors = self.errors + self.positional_errors
+            min_val = min(all_errors)
+            max_val = max(all_errors)
+            data_range = max_val - min_val
+            padding = max(data_range * 0.1, 0.05)
+            plt.ylim(min_val - padding, max_val + padding)
+        except Exception as e:
+            self.get_logger().warn(f"Impossibile calcolare i limiti Y dinamici: {e}")
+            pass
+        try:
+            log_dir = os.path.join(self.pkg_path, "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            plot_path = os.path.join(log_dir, f"error_plot_{datetime.today().strftime('%Y-%m-%d_%H-%M-%S')}.png")
+            plt.savefig(plot_path)
+            self.get_logger().info(f"Grafico salvato in: {plot_path}")
+        except Exception as e:
+            self.get_logger().error(f"Impossibile salvare il grafico: {e}")
         plt.show()
 
-    # ==========================================================
-    #  Arresto sicuro
-    # ==========================================================
     def stop(self):
         self.get_logger().info("Stopping robot...")
-
         twist_msg = Twist()
         twist_msg.linear.x = 0.0
         twist_msg.angular.z = 0.0
 
         for _ in range(10):
             self.cmd_vel.publish(twist_msg)
-
         self.log_performance_indices()
         self.logfile.close()
         self.evaluation_file.close()
         self.get_logger().info("Control node shutting down.")
         rclpy.shutdown()
 
-# ==========================================================
-#  MAIN
-# ==========================================================
 def main(args=None):
     rclpy.init(args=args)
     node = BetterControlNode()

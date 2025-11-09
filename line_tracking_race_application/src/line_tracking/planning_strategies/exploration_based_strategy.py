@@ -8,17 +8,47 @@ from geometry_msgs.msg import Quaternion
 from skimage.morphology import skeletonize
 from sklearn.cluster import DBSCAN
 
-# Helper function to convert quaternions into Euler angles (to extract yaw)
+"""
+Implementation of an exploration-based strategy for autonomous track navigation.
+This class combines exploration and exploitation phases to learn and optimize track navigation.
+
+The strategy works in two phases:
+1. Exploration: Building a map of the track while following centerline
+2. Exploitation: Using the learned map for optimized path planning
+"""
+
 def euler_from_quaternion(x, y, z, w):
-    """Computes roll, pitch, and yaw angles from a quaternion."""
-    # Simple implementation for yaw (pitch and roll are ignored)
+    """
+    Convert quaternion to Euler angles, focusing on yaw (rotation around Z axis).
+    
+    Args:
+        x, y, z, w (float): Components of the quaternion
+        
+    Returns:
+        tuple: (roll, pitch, yaw) in radians, though only yaw is calculated accurately
+    """
     t3 = 2.0 * (w * z + x * y)
     t4 = 1.0 - 2.0 * (y * y + z * z)
     yaw = math.atan2(t3, t4)
     return 0.0, 0.0, yaw
 
 class ExplorationBasedStrategy:
+    """
+    Main class implementing exploration-based autonomous navigation strategy.
+    Handles both exploration and exploitation phases of track navigation.
+    """
     def __init__(self, error_type, should_visualize, node):
+        """
+        Initialize the exploration-based strategy.
+        
+        Args:
+            error_type: Type of error metric to use
+            should_visualize: Boolean flag for visualization
+            node: ROS node handle for communication
+            
+        The strategy maintains a 2D occupancy grid map of the track
+        and uses perspective transform for camera-to-world coordinate conversion.
+        """
         self.node = node
         self.should_visualize = should_visualize
         self.centerline_strategy = BetterCenterlineStrategy(error_type, should_visualize, node)
@@ -56,9 +86,6 @@ class ExplorationBasedStrategy:
             self._on_odometry_received,
             10
         )
-        self.curvature_profile = []
-        self.loop_threshold = 30.0
-        self.coverage_threshold = 2000
         self.curvature_gain = 0.5
         self.lookahead_distance = 800
         self.loop_counter = 0
@@ -85,10 +112,8 @@ class ExplorationBasedStrategy:
             old_x, old_y, old_yaw = self.current_pose
             dist_jump = math.hypot(new_pose[0] - old_x, new_pose[1] - old_y)
             yaw_jump = abs((new_pose[2] - old_yaw + math.pi) % (2 * math.pi) - math.pi)
-
             max_dist = 1.0 if not self.exploration_mode else 0.5
             max_yaw = math.radians(180) if not self.exploration_mode else math.radians(90)
-
             if dist_jump > max_dist or yaw_jump > max_yaw:
                 self.node.get_logger().warn(
                     f"[Odom Filter] Ignored abnormal jump: Δpos={dist_jump:.2f} m, Δyaw={math.degrees(yaw_jump):.1f}°"
@@ -97,6 +122,18 @@ class ExplorationBasedStrategy:
         self.current_pose = new_pose
 
     def plan(self, img_msg):
+        """
+        Main planning method that coordinates between exploration and exploitation modes.
+        
+        Args:
+            img_msg: Camera image message containing track view
+            
+        Returns:
+            float: Computed error value for vehicle control
+            
+        The method switches between exploration and exploitation strategies based on
+        the current mode and publishes relevant control messages.
+        """
         try:
             if self.exploration_mode:
                 err = self._exploration_step(img_msg)
@@ -113,6 +150,18 @@ class ExplorationBasedStrategy:
             return 0.0
 
     def _exploration_step(self, img_msg):
+        """
+        Execute one step in exploration mode.
+        
+        Args:
+            img_msg: Camera image message containing track view
+            
+        Returns:
+            float: Computed error value for steering control
+            
+        Processes the current image to update map and compute steering commands
+        based on local track features.
+        """
         err = self.centerline_strategy.plan(img_msg)
         image = self.centerline_strategy.cv_bridge.imgmsg_to_cv2(img_msg, desired_encoding="bgr8")
         track_outline = self.centerline_strategy.get_track_outline(image)
@@ -121,54 +170,33 @@ class ExplorationBasedStrategy:
         if centerline is None or len(centerline) == 0:
             centerline = np.array([[self.centerline_strategy.prev_waypoint[0],
                                     self.centerline_strategy.prev_waypoint[1]]], dtype=float)
-
         self._update_map(track_outline)
         curvature_camera = self._predict_future_curvature_exploration(centerline)
-        """CURVATURE_THRESHOLD = 0.05  # Soglia di importanza
-
-        if self.cycles_to_hold > 0:
-            # Modality HOLD
-            curvature_to_publish = self.held_curvature
-            self.cycles_to_hold -= 1
-
-            if self.cycles_to_hold < 3 and abs(curvature_camera) > CURVATURE_THRESHOLD:
-                self.cycles_to_hold = self.hold_cycles
-
-        elif abs(curvature_camera) >= CURVATURE_THRESHOLD:
-            # Modality START HOLD
-            self.cycles_to_hold = self.hold_cycles
-            self.held_curvature = curvature_camera
-            curvature_to_publish = curvature_camera
-
-        else:
-            curvature_to_publish = curvature_camera
-        curvature = curvature_to_publish"""
-        # Rimuoviamo la logica 'hold' che crea valori "stale".
-        # Il control_node ha già un suo filtro esponenziale.
         curvature_to_publish = curvature_camera
         curvature = curvature_to_publish
         curvature_msg = Float32()
         curvature_msg.data = float(curvature)
         self.curvature_publisher.publish(curvature_msg)
-        """curvature_msg = Float32()
-        curvature_msg.data = abs(curvature_camera)
-        self.curvature_publisher.publish(curvature_msg)
-        err += curvature_camera * self.curvature_gain"""
         return float(err) if not np.isnan(err) else 0.0
 
     def _exploitation_step(self, img_msg):
         """
-        Exploitation mode: follows the known track and adapts the vehicle’s velocity
-        based on the curvature profile computed in the global map.
+        Execute one step in exploitation mode using the learned track map.
+        
+        Args:
+            img_msg: Camera image message containing track view
+            
+        Returns:
+            float: Computed error value for steering control
+            
+        Uses the previously built map to optimize trajectory and velocity profile.
         """
-        # Standard steering control based on vision
         err = self.centerline_strategy.plan(img_msg)
         if not hasattr(self, "velocity_profile") or len(self.velocity_profile) == 0:
             self.node.get_logger().warn(
                 "[Exploitation] No velocity profile available, using local curvature estimation.")
             current_centerline = self._estimate_current_centerline(img_msg)
             curvature = self._predict_future_curvature(current_centerline)
-            velocity = 1.0 / (1.0 + 10.0 * abs(curvature))
         else:
             x_odom, y_odom, _ = self.current_pose
             self.node.get_logger().info(f"[Exploitation] Pos=({x_odom:.2f},{y_odom:.2f})")
@@ -178,7 +206,6 @@ class ExplorationBasedStrategy:
             ])
             self.node.get_logger().info(f"[Exploitation] Nearest point: {nearest_idx}")
             vx, vy, v_target = self.velocity_profile[nearest_idx]
-            # Low-pass filter to smooth velocity changes
             alpha = 0.2
             if hasattr(self, "prev_velocity"):
                 v_target = alpha * v_target + (1 - alpha) * self.prev_velocity
@@ -186,14 +213,12 @@ class ExplorationBasedStrategy:
             velocity = v_target
             vel_msg = Float32()
             velocity = max(velocity, 0.5)  # velocità minima garantita
-
             vel_msg.data = float(velocity)
             self.node.create_publisher(Float32, '/planning/velocity', 10).publish(vel_msg)
             curvature = self._predict_future_curvature_exploitation()
             curvature_msg = Float32()
             curvature_msg.data = float(curvature)
             self.curvature_publisher.publish(curvature_msg)
-            # Diagnostic log
             self.node.get_logger().info(
                 f"[Exploitation] Pos=({x_odom:.2f},{y_odom:.2f})  -> v_target={velocity:.2f} m/s"
             )
@@ -201,7 +226,16 @@ class ExplorationBasedStrategy:
 
     def _update_map(self, track_outline):
         """
-        Transforms the track pixels from the camera reference frame to the odometry frame.
+        Update the global track map with new observations.
+        
+        Args:
+            track_outline: Binary image of track boundaries
+            
+        This method:
+        1. Cleans track mask using morphological operations
+        2. Transforms detected track points to world coordinates
+        3. Updates occupancy grid map
+        4. Checks for loop closure
         """
         # Apply morphological operations to clean the track mask
         track_outline = cv.morphologyEx(track_outline, cv.MORPH_OPEN, np.ones((3, 3), np.uint8))
@@ -213,7 +247,6 @@ class ExplorationBasedStrategy:
             self.node.get_logger().info("No track pixels detected.")
             return
         yellow_pixel_coords = yellow_pixel_coords[::-1]
-
         # Convert pixel coordinates from camera to vehicle reference frame
         points_camera = np.float32(yellow_pixel_coords[:, [1, 0]]).reshape(-1, 1, 2)
         points_vehicle = cv.perspectiveTransform(points_camera, self.M)
@@ -240,18 +273,15 @@ class ExplorationBasedStrategy:
             px, py = self._world_to_map_coords(x, y)
             if px is not None and py is not None:
                 self.map_matrix[py, px] = 255  # White (track path)
-
         # Launch map visualization if enabled
         if self.should_visualize:
             self._visualize_map()
-
         # Detect loop closure (returning to the same area)
         if self._check_loop_closure(x_odom, y_odom):
             self.node.get_logger().warn(
                 "[ExplorationBasedStrategy] Loop closure detected (same point visited three times). Switching to EXPLOITATION mode."
             )
             self.exploration_mode = False
-
             # 🔹 Compute the velocity profile once upon switching mode
             self.velocity_profile = self._compute_velocity_profile()
             if len(self.velocity_profile) > 0:
@@ -291,38 +321,36 @@ class ExplorationBasedStrategy:
         return float(curvature)
 
     def _predict_future_curvature_exploration(self, centerline):
+        """
+        Estimate upcoming track curvature during exploration phase.
+        
+        Args:
+            centerline: numpy array of centerline points
+            
+        Returns:
+            float: Estimated track curvature value
+            
+        Computes local track curvature using perspective-transformed centerline points.
+        """
         if centerline is None or len(centerline) < 3:
-            return 0.0  # pochi punti, non si può calcolare curvatura
-            # --- INIZIO MODIFICA FONDAMENTALE ---
-            # 1. Trasforma i punti da PIXEL a METRI (coordinate veicolo)
-            #    usando la matrice di trasformazione prospettica M.
+            return 0.0
         try:
             pts_pixels = np.float32(centerline).reshape(-1, 1, 2)
             pts_vehicle = cv.perspectiveTransform(pts_pixels, self.M)
-
-            # Rimuovi la dimensione '1' extra
             pts = pts_vehicle.squeeze()
-
-            # Gestisci il caso in cui squeeze() rimuove troppo
             if pts.ndim == 1:
                 pts = np.array([pts])
-
             if len(pts) < 3:
                 return 0.0
-
         except Exception as e:
             self.node.get_logger().warn(f"Perspective transform failed in curvature calc: {e}")
             return 0.0
-        #pts = np.array(centerline, dtype=float)
         dx = np.gradient(pts[:, 0])
         dy = np.gradient(pts[:, 1])
         ddx = np.gradient(dx)
         ddy = np.gradient(dy)
-
         denominator = np.power(dx ** 2 + dy ** 2, 1.5) + 1e-6
-        #curvature = np.mean(np.abs((dx * ddy - dy * ddx) / denominator))
-        curvature = np.mean((dx * ddy - dy * ddx) / denominator)  # <-- np.abs RIMOSSO
-
+        curvature = np.mean((dx * ddy - dy * ddx) / denominator)
         return float(curvature)
 
     def _world_to_map_coords(self, world_x, world_y):
@@ -342,15 +370,8 @@ class ExplorationBasedStrategy:
             return None, None
 
     def _map_to_world_coords(self, pixel_x, pixel_y):
-        """
-        Converte le coordinate della mappa (pixel) in coordinate del mondo (metri).
-        Questa è l'inversa esatta di _world_to_map_coords.
-        """
-        # Inverti il calcolo per la x
         world_x = self.map_origin_world[0] + \
                   (pixel_x - self.map_origin_pixels[0]) * self.map_resolution
-
-        # Inverti il calcolo per la y (nota l'inversione del segno)
         world_y = self.map_origin_world[1] - \
                   (pixel_y - self.map_origin_pixels[1]) * self.map_resolution
 
@@ -373,6 +394,15 @@ class ExplorationBasedStrategy:
         pass
 
     def _predict_future_curvature_exploitation(self):
+        """
+        Estimate upcoming track curvature during exploitation phase.
+        
+        Returns:
+            float: Estimated track curvature value
+            
+        Uses the built map to predict upcoming curvature more accurately,
+        considering a larger portion of the track ahead.
+        """
         if self.map_matrix is None or np.count_nonzero(self.map_matrix) < 10:
             return 0.0
         map_clean = cv.morphologyEx(self.map_matrix, cv.MORPH_OPEN, np.ones((3, 3), np.uint8))
@@ -395,9 +425,7 @@ class ExplorationBasedStrategy:
         map_yaw = -yaw
         # Calcola l'angolo di ogni punto rispetto alla posizione del robot
         vecs_from_robot = pts - robot_pt
-        # ### <<< NUOVA MODIFICA: Inverti l'asse X o Y per il calcolo dell'angolo
         angles_in_map_frame = np.arctan2(-vecs_from_robot[:, 1], vecs_from_robot[:, 0])
-        # Normalizza la differenza angolare usando il `map_yaw` corretto
         angle_diff = angles_in_map_frame - map_yaw
         angle_diff_normalized = (angle_diff + np.pi) % (2 * np.pi) - np.pi
         front_mask = np.abs(angle_diff_normalized) > (np.pi / 2) #prima era > e andava, forse pure meglio
@@ -405,12 +433,11 @@ class ExplorationBasedStrategy:
 
         if pts_front.shape[0] < 3:
             return 0.0
-        # --- Clusterizzazione per identificare il gruppo più grande ---
         if pts_front.shape[0] > 0:
             # eps: distanza massima tra punti per farli appartenere allo stesso cluster
             # min_samples: minima numerosità per cluster valido
             clustering = DBSCAN(eps=0.1, min_samples=3).fit(
-                pts_front)  # eps va tarato in base alla scala della mappa (pixel)
+                pts_front)
             labels = clustering.labels_
 
             # Filtra solo i punti che appartengono a un cluster (label != -1)
@@ -508,6 +535,15 @@ class ExplorationBasedStrategy:
         return False
 
     def _compute_velocity_profile(self):
+        """
+        Compute optimal velocity profile for the entire track.
+        
+        Returns:
+            list: List of tuples (x, y, velocity) for each track point
+            
+        Uses track geometry and curvature to determine safe and optimal
+        velocities throughout the circuit.
+        """
         map_clean = cv.morphologyEx(self.map_matrix, cv.MORPH_OPEN, np.ones((3, 3), np.uint8))
         map_skel = skeletonize(map_clean > 0)
 
@@ -517,14 +553,13 @@ class ExplorationBasedStrategy:
         # 2. Converti ogni punto (px, py) in (world_x, world_y)
         world_points = []
         for px, py in zip(x_idx, y_idx):
-            wx, wy = self._map_to_world_coords(px, py)  # <-- USA LA NUOVA FUNZIONE
+            wx, wy = self._map_to_world_coords(px, py)
             world_points.append((wx, wy))
 
         pts = np.array(world_points).astype(float)
         if len(pts) < 5:
             return []
 
-        # 3. Ora calcola la curvatura su PTS (che sono in METRI)
         dx = np.gradient(pts[:, 0])
         dy = np.gradient(pts[:, 1])
         ddx = np.gradient(dx)
@@ -532,14 +567,13 @@ class ExplorationBasedStrategy:
         denom = np.power(dx ** 2 + dy ** 2, 1.5) + 1e-6
         curvature = np.abs((dx * ddy - dy * ddx) / denom)
 
-        # 🔹 Smoothing della curvatura
+        #  Smoothing della curvatura
         window = 15
         curvature_smooth = np.convolve(curvature, np.ones(window) / window, mode='same')
 
-        # 🔹 Clipping: evita valori fuori scala
+        #  Clipping: evita valori fuori scala
         curvature_smooth = np.clip(curvature_smooth, 0.0, 0.5)
 
-        # 🔹 Profilo di velocità fisicamente più realistico
         vmax = 5.0  # velocità massima in rettilineo
         a_lat_max = 3.0  # accelerazione laterale massima ammessa (m/s²)
 
@@ -550,10 +584,9 @@ class ExplorationBasedStrategy:
         # Applica limite massimo e minimo
         v_safe = np.clip(v_safe, 3.0, vmax)
 
-        # 🔹 Leggera attenuazione aggiuntiva per sicurezza globale
-        velocity_profile = 0.9 * v_safe
-        # 🔹 Lookahead smoothing: anticipa le curve di N punti (~2-3 metri)
-        lookahead = 200  # 250 sembra ok, solo va troppo lento 200 SEMBRA PERFETT
+
+        # 🔹 Lookahead smoothing: anticipa le curve di N punti
+        lookahead = 200
         curvature_future = np.copy(curvature_smooth)
         for i in range(len(curvature_smooth) - lookahead):
             curvature_future[i] = np.max(curvature_smooth[i:i + lookahead])
@@ -565,8 +598,4 @@ class ExplorationBasedStrategy:
         v_safe = np.clip(v_safe, 2.5, 8.0)
         velocity_profile = 0.9 * v_safe
         velocity_profile = np.convolve(velocity_profile, np.ones(10) / 10, mode='same')
-
-        # 4. Salva il profilo con coordinate in METRI
-        #    (la x è pts[i, 0], la y è pts[i, 1])
         return [(pts[i, 0], pts[i, 1], velocity_profile[i]) for i in range(len(pts))]
-
