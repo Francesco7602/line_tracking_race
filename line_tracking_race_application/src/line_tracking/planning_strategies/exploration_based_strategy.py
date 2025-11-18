@@ -95,6 +95,11 @@ class ExplorationBasedStrategy:
         self.held_curvature = 0.0
         self.mode_publisher = node.create_publisher(Float32, '/planner/mode', 10)
         self.curvature_publisher = node.create_publisher(Float32, '/planning/curvature', 10)
+
+        # Attributes for exploitation mode path following
+        self.last_waypoint_index = 0
+        self.waypoint_search_window = 125
+
         if self.should_visualize:
             self.window_name = "Exploration Map"
             cv.namedWindow(self.window_name, cv.WINDOW_NORMAL)
@@ -199,12 +204,38 @@ class ExplorationBasedStrategy:
             curvature = self._predict_future_curvature(current_centerline)
         else:
             x_odom, y_odom, _ = self.current_pose
-            self.node.get_logger().info(f"[Exploitation] Pos=({x_odom:.2f},{y_odom:.2f})")
-            nearest_idx = np.argmin([
-                math.hypot(px - x_odom, py - y_odom)
-                for (px, py, _) in self.velocity_profile
-            ])
-            self.node.get_logger().info(f"[Exploitation] Nearest point: {nearest_idx}")
+            
+            # --- Optimized Waypoint Search (Moving Window) ---
+            path_points = self.velocity_profile
+            num_path_points = len(path_points)
+
+            # Define the search window
+            start_index = self.last_waypoint_index
+            end_index = (start_index + self.waypoint_search_window) % num_path_points
+
+            # Get points and indices within the window, handling wrap-around
+            if start_index < end_index:
+                window_indices = range(start_index, end_index)
+                window_points = path_points[start_index:end_index]
+            else: # Wrap-around case
+                window_indices = list(range(start_index, num_path_points)) + list(range(0, end_index))
+                window_points = path_points[start_index:] + path_points[:end_index]
+
+            # Find the closest point within the window
+            min_dist = float('inf')
+            closest_local_idx = -1
+            for i, (px, py, _) in enumerate(window_points):
+                dist = math.hypot(px - x_odom, py - y_odom)
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_local_idx = i
+            
+            # Convert local index back to global index and update state
+            nearest_idx = window_indices[closest_local_idx]
+            self.last_waypoint_index = nearest_idx
+            
+            self.node.get_logger().info(f"[Exploitation] Pos=({x_odom:.2f},{y_odom:.2f}), Nearest point: {nearest_idx}")
+
             vx, vy, v_target = self.velocity_profile[nearest_idx]
             alpha = 0.2
             if hasattr(self, "prev_velocity"):
