@@ -146,7 +146,7 @@ class BetterControlNode(Node):
         ANG_SLOPE = 0.6  # pendenza: quanto aumenta max_ang al crescere della velocità
         ANG_OFFSET = 3.0  # offset addizionale
         MAX_ANG_LIMIT = 10.0  # limite superiore assoluto (protezione)
-        MAX_THRUST = getattr(self, "MAX_THRUST", 3.0)
+        MAX_THRUST = getattr(self, "MAX_THRUST", 10.0)
         MAX_SPEED_REDUCTION_RATIO = 0.30
         SATURATION_WARN_RATIO = 0.95
         v = getattr(self, "thrust", None)
@@ -290,7 +290,7 @@ class BetterControlNode(Node):
         v = self.thrust if self.thrust > 0.5 else 0.5
         V_NOMINAL = 2.5
         if v > V_NOMINAL:
-            scale = V_NOMINAL / v
+            scale = V_NOMINAL / v #forse qua ha senso metterlo ad 1...
         else:
             scale = 1.0
         p_term = self.k_p * scale * predicted_error
@@ -303,10 +303,13 @@ class BetterControlNode(Node):
         max_ang = max(0.5, min(8.0, max_ang))  # clamp di sicurezza
         control_output = max(-max_ang, min(max_ang, control_output))
         self.curv_filtered = (self.curv_filter_alpha * self.current_curvature +
-                              (1.0 - self.curv_filter_alpha) * self.curv_filtered)
+                              (1.0 - self.curv_filter_alpha) * self.curv_filtered) #filtro esponenziale (EMA) per stabilizzare la curvatura misurata
+        #Il filtro liscia i valori → curvatura più credibile → controllore più stabile.
         curv_abs = abs(self.curv_filtered)
         if curv_abs < self.curv_ff_threshold or v < self.ff_speed_min:
             curvature_ff = 0.0
+            #Se la curvatura è piccola → la traiettoria è quasi dritta → feedforward inutile.
+            #Se la velocità è troppo bassa → meglio NON fare feedforward (perché genera instabilità).
         else:
             speed_scale = (min(v, self.ff_speed_max) - self.ff_speed_min) / max(1e-6,
                                                                                 (self.ff_speed_max - self.ff_speed_min))
@@ -314,9 +317,10 @@ class BetterControlNode(Node):
             k_ff = self.k_ff_base
             anticipatory_boost = 1.0
             curvature_ff = k_ff * self.curv_filtered * speed_scale * anticipatory_boost
+            #Qua dipende dalla velocità, perché a bassa velocità la curvatura richiesta può essere seguita dal PID; a velocità più alte serve feedforward per anticipare.
 
-        # Clipping del feedforward
-        max_ff = 0.7 * MAX_ANGULAR
+        # Clipping del feedforward perché il feedforward può essere aggressivo
+        max_ff = 0.7 * MAX_ANGULAR #evita che il FF superi il 70% della sterzata massima, lascia spazio al PID per raffinare la correzione, e impedisce sterzate troppo brusche.
         curvature_ff = max(-max_ff, min(max_ff, curvature_ff))
         control_output += curvature_ff
         try:

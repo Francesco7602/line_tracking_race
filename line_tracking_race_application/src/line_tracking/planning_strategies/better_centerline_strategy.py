@@ -1,13 +1,3 @@
-"""
-Centerline Strategy Module for Line Tracking
-
-This module implements a planning strategy for autonomous line tracking that
-revolves around finding the track's centerline and choosing waypoints along it.
-The strategy uses computer vision to detect yellow track markers and computes
-navigation errors for path following.
-
-"""
-
 import math
 import numpy as np
 
@@ -20,7 +10,12 @@ from std_msgs.msg import Float32
 
 from line_tracking.planning_strategies.error_type import ErrorType
 from line_tracking.visualizer import Visualizer
-import line_tracking.colors as colors
+
+"""
+Implementation of an improved centerline following strategy for autonomous racing.
+This strategy focuses on robust centerline detection and tracking while considering
+track boundaries and local geometry.
+"""
 
 # OpenCV hue value constraints
 MAX_HUE = 179  # In OpenCV, hue ranges from 0 to 179 (not 0-360 like standard HSV)
@@ -33,119 +28,54 @@ UPPER_YELLOW = (30, 255, 255) # Upper bound for yellow detection
 
 class BetterCenterlineStrategy:
     """
-    A planning strategy for autonomous line tracking based on centerline detection.
-
-    This class implements a computer vision-based approach to track following where
-    the system detects yellow track boundaries, computes the centerline between them,
-    and selects waypoints for navigation. It supports both offset-based and angle-based
-    error computation methods.
-
-    Attributes:
-        error_type (ErrorType): The type of error calculation to use (OFFSET or ANGLE)
-        node (Node): ROS2 node for logging and communication
-        viz (Visualizer): Optional visualizer for debug display
-        cv_bridge (CvBridge): Bridge for converting ROS image messages to OpenCV format
-        prev_offset (float): Previous offset value for fallback scenarios
-        prev_waypoint (tuple): Previous waypoint coordinates for fallback scenarios
+    Enhanced implementation of centerline-based navigation strategy.
+    Provides improved robustness and performance over basic centerline following.
     """
 
     def __init__(self, error_type, should_visualize, node):
-        """
-        Initialize the centerline strategy.
-
-        Args:
-            error_type (ErrorType): Type of offset error to compute (OFFSET or ANGLE)
-            should_visualize (bool): Whether to visualize debug data in a separate window
-            node (Node): ROS2 node instance for logging and communication
-        """
         self.error_type = error_type
         self.node = node
-
         # Initialize visualizer if requested
         if should_visualize:
             self.viz = Visualizer()
         else:
             self.viz = None
-
         # Initialize ROS-OpenCV bridge for image conversion
         self.cv_bridge = CvBridge()
-
         # Initialize fallback values for when track detection fails
         self.prev_offset = 0
         self.prev_waypoint = (0, 0)
-        # Number of cycles to keep the value fixed (e.g., 20 cycles)
-        self.hold_cycles = 20
-        # Counter for the remaining cycles in "hold mode"
-        self.cycles_to_hold = 0
-        # Curvature value to be maintained
-        self.held_curvature = 0.0
         # Publisher for the curvature topic
         self.curvature_publisher = node.create_publisher(Float32, '/planning/curvature', 10)
+        # Publisher per l'errore di posizione attuale
+        self.positional_error_publisher = node.create_publisher(Float32, '/planning/positional_error', 10)
 
     def plan(self, img_msg):
         """
-        Apply the centerline strategy to process an image and return waypoint error.
-
-        This is the main processing function that:
-        1. Converts ROS image message to OpenCV format
-        2. Detects track boundaries
-        3. Computes centerline
-        4. Selects waypoint
-        5. Calculates navigation error
-
+        Main planning method that processes camera input and generates control commands.
+        
         Args:
-            img_msg: ROS image message containing the camera feed
-
+            img_msg: Camera image message containing track view
+            
         Returns:
-            float: Waypoint error based on the configured error type (offset or angle)
+            float: Computed error value for steering control
         """
         # Convert ROS image message to OpenCV format
         image = self.cv_bridge.imgmsg_to_cv2(img_msg, desired_encoding="bgr8")
         height, width, _ = image.shape
-
         # Extract track outline from the image
         track_outline = self.get_track_outline(image)
-
-        # Crop image to focus on relevant area and remove  border artifacts
-        # - Remove 100 pixels from left/right borders to eliminate edge artifacts
         cropped_outline = track_outline[
             : (height),
             75 : (width - 75)              # Horizontal crop: remove 100px borders
         ]
         cr_height, cr_width = cropped_outline.shape
-
         # Extract left and right track boundaries
         left_limit, right_limit = self.extract_track_limits(cropped_outline)
         # Compute centerline between the track boundaries
         centerline = self.compute_centerline(left_limit, right_limit)
-        # compute the curvature
-        """current_curvature= self.calculate_point_ratio_curvature(left_limit, right_limit)
-        CURVATURE_THRESHOLD = 0.10
-        if self.cycles_to_hold > 0:
-            # Modality HOLD: we use the previous curvature value
-            curvature_to_publish = self.held_curvature
-            self.cycles_to_hold -= 1
-            # If we are near the end of the block, check whether the curve persists
-            if self.cycles_to_hold < 3 and abs(current_curvature) > CURVATURE_THRESHOLD:
-                # If the curve is still strong, reset the timer
-                self.cycles_to_hold = self.hold_cycles
-
-        elif abs(current_curvature) >= CURVATURE_THRESHOLD:
-            # Modalità START HOLD: Trovata una curva forte
-            # Inizializza il timer e memorizza il valore.
-            self.cycles_to_hold = self.hold_cycles
-            self.held_curvature = current_curvature
-            curvature_to_publish = current_curvature
-        else:
-            curvature_to_publish = current_curvature
-        curvature = curvature_to_publish
-        curvature_msg = Float32()
-        curvature_msg.data = float(curvature)
-        self.curvature_publisher.publish(curvature_msg)"""
-
         # Convert the grayscale image to RGB for visualization
         vis_img = cv.cvtColor(cropped_outline, cv.COLOR_GRAY2BGR)
-
         # Draw the left boundary in red
         if left_limit.size > 0:
             for (x, y) in left_limit:
@@ -173,62 +103,58 @@ class BetterCenterlineStrategy:
         # Store values for potential future fallback
         self.prev_waypoint = waypoint
         self.prev_offset = waypoint_offset
-        # Compute navigation error based on configured error type
-        #if self.error_type == ErrorType.OFFSET:
-        #    err, offset = self.compute_offset_error(waypoint, crosshair, cr_width / 2)
-        #elif self.error_type == ErrorType.ANGLE:
         err, angle = self.compute_angle_error(waypoint, position)
-        #else:
-        #    self.node.get_logger().error(f"Unknown error type. Exiting")
-        #    rclpy.shutdown()
-        # Generate debug visualization if enabled
         if self.viz is not None:
             # Build base visualization showing track and centerline
             self.viz.build_track_bg(
                 cr_height, cr_width, left_limit, right_limit, centerline
             )
-            # Add error-specific visualization overlay
-            if self.error_type == ErrorType.OFFSET:
-                self.viz.build_offset_error_overlay(crosshair, waypoint)
-            elif self.error_type == ErrorType.ANGLE:
-                self.viz.build_angle_error_overlay(crosshair, waypoint, position, angle)
-            else:
-                self.node.get_logger().error(f"Unknown error type. Exiting")
-                rclpy.shutdown()
-            # Display the visualization
+            self.viz.build_angle_error_overlay(crosshair, waypoint, position, angle)
             self.viz.show()
+        current_positional_error = 0.0
+        if centerline.size > 0:
+            # 'position' è la posizione X,Y del robot (centro-fondo)
+            robot_x_position = position[0]
+            # Troviamo la X del punto della centerline più in basso
+            # centerline[-1] è (X, Y), quindi prendiamo l'indice 0 (la X)
+            stable_bottom_centerline_x = centerline[-1, 0]
+            raw_pixel_offset = robot_x_position - stable_bottom_centerline_x
+            # --- NORMALIZZAZIONE ---
+            max_offset = cr_width / 2.0
+            if max_offset > 0:
+                current_positional_error = raw_pixel_offset / max_offset
+                # Applichiamo un "clamp" per sicurezza
+                current_positional_error = max(-1.0, min(1.0, current_positional_error))
+        pos_err_msg = Float32()
+        pos_err_msg.data = float(current_positional_error)
+        self.positional_error_publisher.publish(pos_err_msg)
         return err
 
-    def get_track_outline(self, input):
+    def get_track_outline(self, image):
         """
-        Detect the track in the input image and return its contour outline in grayscale.
-
-        This method uses HSV color space filtering to isolate yellow track markers,
-        applies morphological cleaning, finds the largest contour, and draws it
-        as a white shape on a black background.
-
+        Extract track boundaries from camera image.
+        
         Args:
-            input (np.ndarray): Input BGR image from camera
-
+            image: OpenCV image containing track view
+            
         Returns:
-            np.ndarray: Binary grayscale image with track outline
+            numpy.ndarray: Binary image highlighting track boundaries
+            
+        Uses color thresholding and morphological operations to identify track edges.
         """
-        height, width, _ = input.shape
+        height, width, _ = image.shape
 
         # Convert BGR to HSV for color segmentation
-        hsv = cv.cvtColor(input, cv.COLOR_BGR2HSV)
+        hsv = cv.cvtColor(image, cv.COLOR_BGR2HSV)
         mask = cv.inRange(hsv, np.array(LOWER_YELLOW), np.array(UPPER_YELLOW))
-
         # Morphological cleaning to remove noise
         kernel = np.ones((3, 3), np.uint8)
         mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel)
         mask = cv.morphologyEx(mask, cv.MORPH_OPEN, kernel)
-
         # Find contours
         contours, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
         # Create empty binary image
         track_outline = np.zeros((height, width), dtype=np.uint8)
-
         if contours:
             largest_contour = max(contours, key=cv.contourArea)
             cv.drawContours(track_outline, [largest_contour], -1, 255, thickness=-1)  # Fill
@@ -236,16 +162,16 @@ class BetterCenterlineStrategy:
 
     def extract_track_limits(self, track_outline):
         """
-        Extract left and right track boundaries from the track outline image
-        without merging them.
-
+        Separate left and right track boundaries from outline.
+        
         Args:
-            track_outline (np.ndarray): Binary image of the track (0 = background, 255 = track)
-
+            track_outline: Binary image of track boundaries
+            
         Returns:
-            tuple: (left_limit, right_limit) as two numpy arrays of (X, Y) coordinates
+            tuple: (left_boundary, right_boundary) as numpy arrays
+            
+        Processes track outline to identify distinct left and right track edges.
         """
-        # Find all external contours
         contours, _ = cv.findContours(track_outline, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE)
         if not contours:
             return np.array([]), np.array([])
@@ -272,71 +198,72 @@ class BetterCenterlineStrategy:
         return left_limit, right_limit
 
     def compute_centerline(self, left, right):
+        """
+        Compute a robust track centerline using bilateral interpolation
+        of both left and right boundary curves.
+
+        Args:
+            left (numpy.ndarray): Nx2 array with left boundary points (x, y)
+            right (numpy.ndarray): Mx2 array with right boundary points (x, y)
+
+        Returns:
+            numpy.ndarray: Kx2 array with the computed centerline points.
+        """
+
+        # Basic sanity check
         if left.size == 0 or right.size == 0:
             self.node.get_logger().info("No track limits found, can't compute centerline.")
             return np.array([])
 
-        # Sort both arrays by the Y coordinate in ascending order
+        # Sort both boundaries by Y ascending
         left = left[left[:, 1].argsort()]
         right = right[right[:, 1].argsort()]
 
-        # Extract the vector of Y coordinates from the left boundary points
-        y_vals = left[:, 1]
-
-        # Perform interpolation only if there are enough points on the right boundary
-        if right.shape[0] < 2:  # If the right side has fewer than 2 points, interpolation is not possible
+        # Need at least 2 points per boundary for interpolation
+        if left.shape[0] < 2 or right.shape[0] < 2:
             return np.array([])
 
-        # Interpolate the X coordinates of the right boundary based on the Y coordinates of the left boundary
-        right_interp_x = np.interp(y_vals, right[:, 1], right[:, 0])
-        # Result: a vector of estimated X coordinates for the right boundary corresponding to each Y in the left boundary
+        # Build a common Y-grid by merging and sorting unique Y-coordinates
+        y_left = left[:, 1]
+        y_right = right[:, 1]
+        y_common = np.unique(np.concatenate((y_left, y_right)))
 
-        # Compute lane width for each Y as the absolute difference between left X and interpolated right X
-        lane_width = np.abs(left[:, 0] - right_interp_x)
+        # Interpolate X_left and X_right on the common Y axis
+        left_interp_x = np.interp(y_common, y_left, left[:, 0])
+        right_interp_x = np.interp(y_common, y_right, right[:, 0])
 
-        # Define width thresholds (including a maximum threshold)
+        # Compute lane width
+        lane_width = np.abs(left_interp_x - right_interp_x)
+
+        # Define minimum/maximum allowed lane width
         MIN_LANE_WIDTH = 10
         MAX_LANE_WIDTH = 90
 
-        # Filter out points where the lane is too narrow or too wide
-        valid_indices = (lane_width > MIN_LANE_WIDTH) & (lane_width < MAX_LANE_WIDTH)
+        # Keep only valid widths
+        valid = (lane_width > MIN_LANE_WIDTH) & (lane_width < MAX_LANE_WIDTH)
 
-        # Apply the filter
-        valid_y_vals = y_vals[valid_indices]
-        valid_left_x = left[:, 0][valid_indices]
-        valid_right_x = right_interp_x[valid_indices]
-
-        # If no valid points remain after filtering, return an empty array
-        if valid_y_vals.size == 0:
+        if not np.any(valid):
             return np.array([])
 
-        # Compute the centerline as the midpoint between the left and right X coordinates
-        centerline_x = (valid_left_x + valid_right_x) / 2
-        centerline = np.column_stack((centerline_x, valid_y_vals))
+        # Apply filtering
+        y_valid = y_common[valid]
+        left_valid_x = left_interp_x[valid]
+        right_valid_x = right_interp_x[valid]
+
+        # Compute the centerline as the midpoint between left and right x-coordinates
+        center_x = (left_valid_x + right_valid_x) / 2.0
+
+        # Produce final Nx2 array
+        centerline = np.column_stack((center_x, y_valid))
 
         return centerline
 
     def get_next_waypoint(self, trajectory, crosshair):
-        """
-        Select the next waypoint from the trajectory based on crosshair position.
-
-        This method finds the closest point on the centerline trajectory that is
-        ahead of the vehicle (above the crosshair in image coordinates).
-
-        Args:
-            trajectory (np.ndarray): Array of centerline points
-            crosshair (tuple): (x, y) coordinates of screen center
-
-        Returns:
-            tuple: (waypoint, x_offset) where waypoint is (x, y) coordinates
-                   and x_offset is the horizontal offset from crosshair
-        """
         # Handle empty trajectory case
         if trajectory.size == 0:
             return crosshair, 0
 
         center_x, center_y = crosshair
-
         # Find the closest valid waypoint
         closest = 0
         closest_dist = float("inf")
@@ -346,111 +273,36 @@ class BetterCenterlineStrategy:
             # (30 pixel buffer to avoid selecting waypoints too close to vehicle)
             if y > center_y - 30:
                 continue
-
             # Calculate Euclidean distance to crosshair
             dist = math.sqrt((x - center_x) ** 2 + (y - center_y) ** 2)
-
             # Update closest waypoint if this one is closer
             if dist < closest_dist:
                 closest_dist = dist
                 closest = i
-
         # Return the closest waypoint and its horizontal offset
         waypoint = trajectory[closest]
         x_offset = waypoint[0] - center_x
-
         return waypoint, x_offset
 
     def compute_offset_error(self, waypoint, crosshair, max_offset):
-        """
-        Compute the horizontal offset error to the waypoint.
-
-        This method calculates the horizontal distance between the crosshair
-        and waypoint, then normalizes it to the [-1, 1] range.
-
-        Args:
-            waypoint (tuple): (x, y) coordinates of target waypoint
-            crosshair (tuple): (x, y) coordinates of screen center
-            max_offset (float): Maximum possible offset value for normalization
-
-        Returns:
-            tuple: (normalized_error, raw_offset) where normalized_error is in [-1, 1]
-                   and raw_offset is the actual pixel offset
-        """
         # Calculate raw horizontal offset
         offset =  crosshair[0] - waypoint[0]
-
-        # Normalize offset to [-1, 1] range
-        # Formula: (offset + max_offset) / (2 * max_offset) * 2 - 1
-        # Simplified to: (offset + max_offset) / max_offset - 1
         normalized_error = (offset + max_offset) / max_offset - 1
-
         return normalized_error, offset
 
     def compute_angle_error(self, waypoint, position):
-        """
-        Compute the angular error to the waypoint.
-
-        This method calculates the angle between the vehicle's forward direction
-        (vertical line) and the line connecting the vehicle to the waypoint,
-        then normalizes it to the [-1, 1] range.
-
-        Args:
-            waypoint (tuple): (x, y) coordinates of target waypoint
-            position (tuple): (x, y) coordinates of vehicle position
-
-        Returns:
-            tuple: (normalized_error, raw_angle) where normalized_error is in [-1, 1]
-                   and raw_angle is the actual angle in degrees
-        """
         # Calculate distance to waypoint
         dist = math.sqrt(
             (waypoint[0] - position[0]) ** 2 + (waypoint[1] - position[1]) ** 2
         )
-
         # Calculate angle using arcsine (horizontal displacement / total distance)
         # This gives the angle from the vertical (forward direction)
         angle = math.asin((position[0] - waypoint[0]) / dist)
-
         # Convert from radians to degrees
         angle_deg = angle * 180 / math.pi
-
         # Normalize angle from [-90, 90] degrees to [-1, 1] range
         # Formula: (angle + 90) / 180 * 2 - 1
         # Simplified to: (angle + 90) / 90 - 1
         normalized_error = (angle_deg + 90) / 90 - 1
 
         return normalized_error, angle_deg
-
-    def calculate_point_ratio_curvature(self, left_limit, right_limit):
-        # NOTE: Deprecated method — no longer used in the current system.
-        # This function was originally designed to estimate curvature
-        # based on the ratio of detected points along the left and right track boundaries.
-
-        """
-        Calculates curvature based on the ratio of point counts on the track boundaries.
-        """
-
-        left_count = len(left_limit)
-        right_count = len(right_limit)
-        if left_count == 0 or right_count == 0:
-            return 0.0  # Straight line / not detected
-        # Compute the imbalance ratio
-        # The index ranges from 0.0 (all on the right) to 1.0 (all on the left), with 0.5 meaning balanced
-        total_count = left_count + right_count
-        ratio = left_count / total_count
-        # Compute the deviation from 0.5 (perfectly straight)
-        # Output is an absolute value: 0 (straight) to 0.5 (maximum curvature)
-        # Example: 0.5 - 0.7 = -0.2 → abs = 0.2
-        # Example: 0.5 - 0.3 =  0.2 → abs = 0.2
-        deviation = abs(ratio - 0.5)
-        MAX_DEVIATION_FOR_CURVE = 0.05
-        curvature_magnitude = min(1.0, deviation / MAX_DEVIATION_FOR_CURVE)
-        # Determine the curve direction (+1 for left, -1 for right)
-        # If ratio > 0.5, there are more points on the left → right turn
-        # If ratio < 0.5, there are more points on the right → left turn
-        direction = -1.0 if ratio > 0.5 else 1.0  # Convention: +1 = left turn, -1 = right turn
-        # The final curvature value combines magnitude and direction,
-        # providing an indication of both strength and orientation of the curve.
-        final_curvature = curvature_magnitude * direction
-        return final_curvature

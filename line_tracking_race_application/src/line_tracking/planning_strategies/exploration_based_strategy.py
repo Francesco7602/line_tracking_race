@@ -55,7 +55,7 @@ class ExplorationBasedStrategy:
 
         self.exploration_mode = True
         self.map_resolution = 0.02  # meters per pixel
-        self.map_size_meters = 50.0  # 50x50 m total map area
+        self.map_size_meters = 75.0  # 50x50 m total map area
         self.map_size_pixels = int(self.map_size_meters / self.map_resolution)
 
         # 2D map: initially all zeros
@@ -247,7 +247,8 @@ class ExplorationBasedStrategy:
             self.node.get_logger().info("No track pixels detected.")
             return
         yellow_pixel_coords = yellow_pixel_coords[::-1]
-        # Convert pixel coordinates from camera to vehicle reference frame
+        #2. Transforms detected track points to world coordinates
+        #2a - Convert pixel coordinates from camera to vehicle reference frame
         points_camera = np.float32(yellow_pixel_coords[:, [1, 0]]).reshape(-1, 1, 2)
         points_vehicle = cv.perspectiveTransform(points_camera, self.M)
         points_vehicle_2d = points_vehicle.squeeze()
@@ -259,6 +260,7 @@ class ExplorationBasedStrategy:
         if self.current_pose is None:
             self.node.get_logger().warn("Odometry pose not available.")
             return
+        #2b – Vehicle → World Coordinates
         x_odom, y_odom, yaw_odom = self.current_pose
         c = np.cos(yaw_odom)
         s = np.sin(yaw_odom)
@@ -267,7 +269,7 @@ class ExplorationBasedStrategy:
         # Apply rotation and translation directly to points_vehicle_2d
         points_rotated = points_vehicle_2d @ rotation_matrix.T
         points_odom = points_rotated + np.array([x_odom, y_odom])
-        # Sample and update points on the 2D occupancy map
+        # Sample and update points on the 2D occupancy map - 3. World → Map Coordinates
         sampled_points_odom = points_odom[::1]
         for (x, y) in sampled_points_odom:
             px, py = self._world_to_map_coords(x, y)
