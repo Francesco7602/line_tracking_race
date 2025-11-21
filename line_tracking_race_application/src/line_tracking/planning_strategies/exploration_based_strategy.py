@@ -57,29 +57,14 @@ class ExplorationBasedStrategy:
         self.map_resolution = 0.02  # meters per pixel
         self.map_size_meters = 75.0  # 50x50 m total map area
         self.map_size_pixels = int(self.map_size_meters / self.map_resolution)
-
+        #        camea info nei topic, matrice di calibrazione, mappa il piano immagin in punti 3d e puo usare quelli
         # 2D map: initially all zeros
         self.map_matrix = np.zeros((self.map_size_pixels, self.map_size_pixels), dtype=np.uint8)
         self.map_origin_world = (0.0, 0.0)
         self.map_origin_pixels = (self.map_size_pixels // 2, self.map_size_pixels // 2)
         self.current_pose = None  # (x_odom, y_odom, yaw_odom)
 
-        source_points = np.float32([
-            [290, 300],  # A: Top left
-            [350, 300],  # B: Top right
-            [440, 480],  # C: Bottom right
-            [200, 480]  # D: Bottom left
-        ])
-
-        # (+X forward, +Y left)
-        destination_points_standard = np.float32([
-            [3.0, 0.5],  # A: 3m forward, 0.5m left
-            [3.0, -0.5],  # B: 3m forward, 0.5m right (-Y)
-            [0.0, -0.5],  # C: 0m forward, 0.5m right (-Y)
-            [0.0, 0.5]  # D: 0m forward, 0.5m left
-        ])
-        # Compute the new Transformation Matrix
-        self.M = cv.getPerspectiveTransform(source_points, destination_points_standard)
+        self.M = None
         self.odom_subscriber = node.create_subscription(
             Odometry,
             '/car/odom',
@@ -106,6 +91,133 @@ class ExplorationBasedStrategy:
             cv.resizeWindow(self.window_name, self.map_size_pixels, self.map_size_pixels)
 
         self.node.get_logger().info("[ExplorationBasedStrategy] Started in EXPLORATION mode.")
+
+    def set_camera_info(self, camera_info):
+        """
+        Calculates the Inverse Perspective Mapping (IPM) matrix (self.M) using camera
+        intrinsics and the camera's extrinsic parameters (height and pitch).
+
+        This matrix is crucial for transforming points from the 2D camera image
+        plane to a 2D bird's-eye view of the ground plane (vehicle frame).
+        This allows for accurate measurement of distances and positions on the track.
+
+        Args:
+            camera_info (CameraInfo): ROS CameraInfo message containing camera
+                                      intrinsic parameters (K matrix, width, height).
+        """
+        self.node.get_logger().info("--- DEBUG: Calculating IPM matrix ---")
+        
+        # Camera extrinsic parameters (height and pitch)
+        # NOTE: The value of h = 0.72 is determined empirically to produce a correct
+        # perspective transform. While calculations based on the URDF suggest a height
+        # of 0.57m, the empirical value works, suggesting a subtle difference in
+        # how the simulation environment interprets the coordinate frames.
+        h = 0.72  # Camera height above the ground plane in meters
+        pitch = math.pi / 6.0 # Camera pitch angle (upward tilt) in radians
+        self.node.get_logger().info(f"DEBUG: Using h={h}, pitch={pitch} (radians)")
+        
+        # Camera intrinsics from CameraInfo message
+        width = camera_info.width
+        height = camera_info.height
+        K = np.array(camera_info.k).reshape((3, 3))
+        fx = K[0, 0] # Focal length in x-direction
+        fy = K[1, 1] # Focal length in y-direction
+        cx = K[0, 2] # Principal point x-coordinate
+        cy = K[1, 2] # Principal point y-coordinate
+        self.node.get_logger().info(f"DEBUG: Camera intrinsics: w={width}, h={height}, fx={fx}, fy={fy}, cx={cx}, cy={cy}")
+
+        def project_to_image(x, y, z=0):
+            """
+            Projects a 3D point from the robot's base_link frame (world frame for this context)
+            onto the 2D camera image plane.
+
+            Args:
+                x (float): X-coordinate of the 3D point in base_link frame (forward).
+                y (float): Y-coordinate of the 3D point in base_link frame (left).
+                z (float): Z-coordinate of the 3D point in base_link frame (up).
+                           Defaults to 0, assuming points are on the ground plane.
+
+            Returns:
+                list: [u, v] pixel coordinates in the image, or None if the point
+                      is behind the camera or outside image bounds.
+            """
+            self.node.get_logger().info(f"DEBUG project_to_image: world point in = ({x}, {y}, {z})")
+            p_world = np.array([x, y, z]) # Point in base_link frame
+
+            # Camera position relative to base_link frame
+            cam_pos_world = np.array([0.2, 0, h]) # X=0.2m forward, Y=0, Z=h (camera height)
+            
+            # Vector from camera origin to the 3D point, expressed in base_link frame
+            p_rel_cam = p_world - cam_pos_world
+            self.node.get_logger().info(f"DEBUG project_to_image: p_rel_cam = {p_rel_cam}")
+
+            # Rotation matrix from base_link frame to camera_link frame
+            # This accounts for the camera's pitch (upward tilt)
+            # Rotates a point by -pitch around the Y-axis
+            R_world_to_cam_link = np.array([
+                [math.cos(-pitch), 0, math.sin(-pitch)],
+                [0, 1, 0],
+                [-math.sin(-pitch), 0, math.cos(-pitch)]
+            ])
+            
+            # Transform the point into the camera_link frame
+            p_cam_link = R_world_to_cam_link @ p_rel_cam
+            self.node.get_logger().info(f"DEBUG project_to_image: p_cam_link = {p_cam_link}")
+            
+            # Rotation matrix from camera_link frame to camera_optical frame
+            # This is a standard ROS transformation:
+            # camera_link (X-fwd, Y-left, Z-up) -> camera_optical (X-right, Y-down, Z-fwd)
+            R_cam_link_to_opt = np.array([
+                [0, -1, 0],
+                [0, 0, -1],
+                [1, 0, 0]
+            ])
+            # Transform the point into the camera_optical frame (OpenCV convention)
+            p_cam_optical = R_cam_link_to_opt @ p_cam_link
+            self.node.get_logger().info(f"DEBUG project_to_image: p_cam_optical = {p_cam_optical}")
+
+            # Check if the point is behind the camera (Z-coordinate <= 0)
+            if p_cam_optical[2] <= 0:
+                self.node.get_logger().error(f"DEBUG project_to_image: Point is behind camera (z <= 0).")
+                return None
+                
+            # Pinhole camera projection model
+            # u = fx * (X_optical / Z_optical) + cx
+            # v = fy * (Y_optical / Z_optical) + cy
+            u = fx * p_cam_optical[0] / p_cam_optical[2] + cx
+            v = fy * p_cam_optical[1] / p_cam_optical[2] + cy
+            self.node.get_logger().info(f"DEBUG project_to_image: projected (u,v) = ({u}, {v})")
+            
+            # Check if the projected point is within the image bounds
+            if not (0 <= u < width and 0 <= v < height):
+                self.node.get_logger().error(f"DEBUG project_to_image: Point is outside image bounds.")
+                return None
+
+            return [u, v]
+
+        # Define a rectangle in the world frame (ground plane) that we expect to see in the camera image.
+        # The points are [X, Y] coordinates in meters, relative to the robot's base_link.
+        # X is forward, Y is left.
+        world_rect = np.float32([
+            [1.0,  0.4],  # Top-left in world, will be upper-left in image
+            [1.0, -0.4],  # Top-right in world, will be upper-right in image
+            [0.5, -0.4],  # Bottom-right in world, will be lower-right in image
+            [0.5,  0.4]   # Bottom-left in world, will be lower-left in image
+        ])
+        self.node.get_logger().info(f"DEBUG: Using world_rect = {world_rect.tolist()}")
+
+        source_points = [project_to_image(p[0], p[1]) for p in world_rect]
+        self.node.get_logger().info(f"DEBUG: Calculated source_points = {source_points}")
+
+        if any(p is None for p in source_points):
+            self.node.get_logger().error("--- DEBUG: Failed to project all points. Cannot compute IPM. ---")
+            return
+
+        source_points_np = np.float32(source_points)
+        destination_points_np = world_rect
+
+        self.M = cv.getPerspectiveTransform(source_points_np, destination_points_np)
+        self.node.get_logger().info(f"--- DEBUG: IPM matrix calculated successfully. M = {self.M.tolist()} ---")
 
     def _on_odometry_received(self, msg: Odometry):
         pos = msg.pose.pose.position
@@ -139,6 +251,10 @@ class ExplorationBasedStrategy:
         The method switches between exploration and exploitation strategies based on
         the current mode and publishes relevant control messages.
         """
+        if self.M is None:
+            self.node.get_logger().warn("IPM matrix not available yet, skipping plan.")
+            return 0.0
+            
         try:
             if self.exploration_mode:
                 err = self._exploration_step(img_msg)
@@ -600,7 +716,7 @@ class ExplorationBasedStrategy:
         denom = np.power(dx ** 2 + dy ** 2, 1.5) + 1e-6
         curvature = np.abs((dx * ddy - dy * ddx) / denom)
 
-        #  Smoothing della curvatura
+        #  Smoothing della curvatura per la velcoita massima puoi usare il peso della macchina e l attrito simulato della pisat, quindi puio avere il valroe toeirco
         window = 15
         curvature_smooth = np.convolve(curvature, np.ones(window) / window, mode='same')
 
@@ -610,7 +726,9 @@ class ExplorationBasedStrategy:
         vmax = 5.0  # velocità massima in rettilineo
         a_lat_max = 3.0  # accelerazione laterale massima ammessa (m/s²)
 
-        # Calcola velocità ammissibile per ogni curvatura: v = sqrt(a_lat_max / curv)
+        # Calcola velocità ammissibile per ogni curvatura: v = sqrt(a_lat_max / curv) e calcola sulla curvatura locale
+        # si potrebbe eliminare, ma per ora lo lascio
+        # Questa è la velocità ideale se la macchina frenasse esattamente nel punto dove la curva  inizia, quindi non va bene perch e troppo tardiva
         with np.errstate(divide='ignore', invalid='ignore'):
             v_safe = np.sqrt(a_lat_max / np.maximum(curvature_smooth, 1e-4))
 
@@ -618,7 +736,7 @@ class ExplorationBasedStrategy:
         v_safe = np.clip(v_safe, 3.0, vmax)
 
 
-        # 🔹 Lookahead smoothing: anticipa le curve di N punti
+        # 🔹 Lookahead smoothing: anticipa le curve di N punti e rallenta prima della curva effettiva
         lookahead = 200
         curvature_future = np.copy(curvature_smooth)
         for i in range(len(curvature_smooth) - lookahead):

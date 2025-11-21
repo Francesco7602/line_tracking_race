@@ -160,9 +160,9 @@ class BetterControlNode(Node):
         if max_ang > MAX_ANG_LIMIT:
             max_ang = MAX_ANG_LIMIT
 
-        # --- soft saturation su angular_z ---
+        # --- soft saturation su angular_z --- Serve a evitare scatti bruschi quando il volante arriva al limite
         # se angular_z è grande rispetto a max_ang, applichiamo una tanh per smussare
-        # angular_z_saturated = max_ang * tanh( angular_z / max_ang )
+        # Invece di sbattere contro un "muro", il valore viene "schiacciato" progressivamente man mano che si avvicina al massimo.
         if max_ang > 0.0:
             angular_ratio = angular_z / max_ang
             angular_z_saturated = max_ang * math.tanh(angular_ratio)
@@ -174,18 +174,6 @@ class BetterControlNode(Node):
         turn_aggressiveness = min(1.0, abs(angular_z_saturated) / (max_ang + 1e-6))
         speed_reduction_factor = 1.0 - MAX_SPEED_REDUCTION_RATIO * turn_aggressiveness
         linear_x_after = max(0.0, linear_x) * speed_reduction_factor
-        # --- anti-windup ---
-        # segnala al PID se siamo in saturazione così puoi decidere di frenare l'integrale.
-        saturated_ang = abs(angular_z_saturated) >= (SATURATION_WARN_RATIO * max_ang)
-        saturated_lin = linear_x_after >= (SATURATION_WARN_RATIO * MAX_THRUST)
-        if saturated_ang or saturated_lin:
-            #scala leggermente integrale se esiste
-            pid = getattr(self, "pid", None)
-            if pid is not None and hasattr(pid, "integral"):
-                try:
-                    pid.integral *= 0.9
-                except Exception:
-                    pass
         self.publish_cmd_vel(linear_x_after, angular_z_saturated)
         debug_line = {
             "v": v,
@@ -194,9 +182,7 @@ class BetterControlNode(Node):
             "requested_angular": angular_z,
             "angular_after": angular_z_saturated,
             "max_ang": max_ang,
-            "turn_aggressiveness": turn_aggressiveness,
-            "saturated_ang": saturated_ang,
-            "saturated_lin": saturated_lin
+            "turn_aggressiveness": turn_aggressiveness
         }
         self.get_logger().info(f"Control loop: {debug_line}")
     def handle_error_callback(self, msg):

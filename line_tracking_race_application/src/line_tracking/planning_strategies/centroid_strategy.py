@@ -93,6 +93,11 @@ class CentroidStrategy:
         hsv = cv.cvtColor(image, cv.COLOR_BGR2HSV)
         mask = cv.inRange(hsv, np.array(LOWER_YELLOW), np.array(UPPER_YELLOW))
 
+        # Create a mask to only consider the bottom half of the image
+        roi_mask = np.zeros_like(mask)
+        roi_mask[height // 2:, :] = 255
+        mask = cv.bitwise_and(mask, roi_mask)
+
         # Compute centroid using image moments
         M = cv.moments(mask)
         if M["m00"] != 0:

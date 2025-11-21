@@ -113,7 +113,7 @@ class BetterCenterlineStrategy:
             self.viz.show()
         current_positional_error = 0.0
         if centerline.size > 0:
-            # 'position' è la posizione X,Y del robot (centro-fondo)
+            # 'position' è la posizione X,Y del robot (centro-fondo) max_ang = (ANG_SLOPE * v) + ANG_OFFSET puoi usare la curvatura che hai gia
             robot_x_position = position[0]
             # Troviamo la X del punto della centerline più in basso
             # centerline[-1] è (X, Y), quindi prendiamo l'indice 0 (la X)

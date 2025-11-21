@@ -11,7 +11,7 @@ numerical error signals that the PID controller can use for navigation.
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import Float32
 import sys
 
@@ -59,6 +59,7 @@ class PlannerNode(Node):
         self._setup_ros_communication()
         
         self.get_logger().info("Planner node initialized successfully!")
+        self.camera_info_received = False
 
     def _declare_node_parameters(self):
         """
@@ -178,6 +179,21 @@ class PlannerNode(Node):
         
         self.get_logger().info("ROS2 communication setup complete")
 
+        self.camera_info_sub = self.create_subscription(
+            CameraInfo,
+            '/car/camera/camera_info',
+            self.camera_info_callback,
+            10
+        )
+
+    def camera_info_callback(self, msg: CameraInfo):
+        if not self.camera_info_received:
+            self.get_logger().info("Camera info received.")
+            if hasattr(self.strategy, 'set_camera_info'):
+                self.strategy.set_camera_info(msg)
+            self.camera_info_received = True
+            # self.destroy_subscription(self.camera_info_sub)
+
     def camera_callback(self, msg: Image):
         """
         Process incoming camera images and publish tracking error.
@@ -191,6 +207,9 @@ class PlannerNode(Node):
         Args:
             msg (Image): ROS2 Image message containing camera frame
         """
+        if not self.camera_info_received:
+            self.get_logger().debug("Camera info not received yet, skipping frame.")
+            return
         # Process the image using the selected strategy
         # This is where the computer vision magic happens
         calculated_error = self.strategy.plan(msg)
