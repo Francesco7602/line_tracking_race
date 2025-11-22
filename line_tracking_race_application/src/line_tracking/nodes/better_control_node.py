@@ -47,12 +47,14 @@ class BetterControlNode(Node):
         self.declare_parameter("k_p", 0.0)
         self.declare_parameter("k_i", 0.0)
         self.declare_parameter("k_d", 0.0)
+        self.declare_parameter("k_ff_base", 1.0)
 
     def _get_parameters(self):
         self.max_duration = self.get_parameter("duration").get_parameter_value().double_value
         self.k_p = 7.5
         self.k_i = 0.0
         self.k_d = 2.5
+        self.k_ff_base = 0.# self.get_parameter("k_ff_base").get_parameter_value().double_value
 
     def _setup_logging(self):
         date = datetime.today().strftime("%Y-%m-%d_%H-%M-%S")
@@ -79,7 +81,6 @@ class BetterControlNode(Node):
         self.curv_filtered = 0.0
         self.curv_filter_alpha = 0.2  # 0..1, piccolo = più smoothing
         # parametri feedforward
-        self.k_ff_base = 0.0
         self.curv_ff_threshold = 0.0  # soglia sotto cui non anticipare
         self.ff_speed_min = 0.2  # velocità minima per applicare feedforward
         self.ff_speed_max = 8.0  # velocità massima per scaling
