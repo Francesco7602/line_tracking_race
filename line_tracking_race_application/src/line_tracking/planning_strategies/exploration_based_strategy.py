@@ -744,9 +744,17 @@ class ExplorationBasedStrategy:
         curvature_future[-lookahead:] = curvature_smooth[-lookahead:]
 
         # 🔹 Ricalcola velocità in base alla curvatura futura
-        a_lat_max = 3.0  # m/s²
-        v_safe = np.sqrt(a_lat_max / np.maximum(curvature_future, 1e-4))
-        v_safe = np.clip(v_safe, 2.5, 8.0)
+        # Formula fisica: v = sqrt(mu * g / curvatura)
+        # dove mu è il coefficiente di attrito e g è l'accelerazione di gravità.
+        MU = 0.8   # Coefficiente di attrito (valore tipico per gomma su asfalto asciutto)
+        G = 9.81   # Accelerazione di gravità (m/s^2)
+        a_lat_max = MU * G
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            v_safe = np.sqrt(a_lat_max / np.maximum(curvature_future, 1e-4))
+
+        # Applica limiti di velocità per sicurezza e stabilità
+        v_safe = np.clip(v_safe, 2.0, 8.0)
         velocity_profile = 0.9 * v_safe
         velocity_profile = np.convolve(velocity_profile, np.ones(10) / 10, mode='same')
         return [(pts[i, 0], pts[i, 1], velocity_profile[i]) for i in range(len(pts))]

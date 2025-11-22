@@ -54,7 +54,7 @@ class BetterControlNode(Node):
         self.k_p = 7.5
         self.k_i = 0.0
         self.k_d = 2.5
-        self.k_ff_base = 0.# self.get_parameter("k_ff_base").get_parameter_value().double_value
+        self.k_ff_base = 0.4# self.get_parameter("k_ff_base").get_parameter_value().double_value
 
     def _setup_logging(self):
         date = datetime.today().strftime("%Y-%m-%d_%H-%M-%S")
@@ -84,6 +84,9 @@ class BetterControlNode(Node):
         self.curv_ff_threshold = 0.0  # soglia sotto cui non anticipare
         self.ff_speed_min = 0.2  # velocità minima per applicare feedforward
         self.ff_speed_max = 8.0  # velocità massima per scaling
+        self.control_error_weight = 1.0 # Weight for the future error
+        self.positional_error_weight = 0.0 # Weight for the current positional error
+        self.k_p_positional = 0.05 # Proportional gain for the positional error corrector
 
     def _setup_ros_communication(self):
         self.cmd_vel = self.create_publisher(Twist, "/car/cmd_vel", 10)
@@ -98,7 +101,7 @@ class BetterControlNode(Node):
         self.base_gains = {"kp": 7.5, "ki": 0.0, "kd": 2.5}  # valori di riferimento
         self.mode_gain_map = {
             0.0: {"kp": 7.5, "ki": 0.0, "kd": 2.5},  # exploration
-            1.0: {"kp": 12.0, "ki": 0.0, "kd": 4.5}  # exploitation
+            1.0: {"kp": 11.0, "ki": 0.0, "kd": 6.0}  # exploitation
         }
         self.v_nominal = 2.5  # per scaling dinamico
 
@@ -195,7 +198,7 @@ class BetterControlNode(Node):
             
         Updates control state and triggers new control computation.
         """
-        error = msg.data
+        error_from_msg = msg.data # This is the future error
         time_now = self.get_clock().now()
 
         # Inizializzazione temporale
@@ -203,15 +206,15 @@ class BetterControlNode(Node):
             self.time_start = time_now
             self.time_prev = time_now
             self.started = True
-            self.prev_error = error
+            self.prev_error = error_from_msg # Use error_from_msg here
 
             self.times_errors.append(0.0)
-            self.errors.append(error)
+            self.errors.append(error_from_msg) # Use error_from_msg here
             return
 
         elapsed = (time_now - self.time_start).nanoseconds / 1e9
         self.times_errors.append(elapsed)  # Aggiungi il tempo per l'errore di controllo
-        self.errors.append(error)  # Aggiungi l'errore di controllo
+        self.errors.append(error_from_msg)  # Aggiungi l'errore di controllo
 
         dt = (time_now - self.time_prev).nanoseconds / 1e9
         if dt <= 0.0:
@@ -223,10 +226,24 @@ class BetterControlNode(Node):
             self.stop()
             return
 
-        self._update_performance_metrics(error, dt)
-        control_output = self._calculate_pid_control(error, dt)
-        self.prev_error = error
+        # Calculate combined error
+        # Ensure current_positional_error has been received at least once
+        if hasattr(self, 'current_positional_error'):
+            combined_error = (self.control_error_weight * error_from_msg +
+                              self.positional_error_weight * self.current_positional_error)
+        else:
+            # Fallback if positional error hasn't been received yet
+            combined_error = error_from_msg
+
+        self._update_performance_metrics(combined_error, dt)
+        control_output = self._calculate_pid_control(combined_error, dt)
+        self.prev_error = combined_error
         self.time_prev = time_now
+
+        # Add the secondary correction based on the current positional error
+        if hasattr(self, 'current_positional_error'):
+            positional_correction = self.k_p_positional * self.current_positional_error
+            control_output += positional_correction
 
         # Aggiorna thrust
         self._update_thrust()
