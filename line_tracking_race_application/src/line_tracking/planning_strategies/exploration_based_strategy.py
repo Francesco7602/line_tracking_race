@@ -570,39 +570,39 @@ class ExplorationBasedStrategy:
         closest_contour = min(contours, key=lambda c: np.min(np.linalg.norm(c.squeeze() - robot_pt, axis=1)))
         pts = closest_contour.squeeze().astype(float)
 
-        # Converti lo yaw nel sistema di coordinate dell'immagine
+        # Convert yaw to the image coordinate system
         map_yaw = -yaw
-        # Calcola l'angolo di ogni punto rispetto alla posizione del robot
+        # Calculate the angle of each point with respect to the robot's position
         vecs_from_robot = pts - robot_pt
         angles_in_map_frame = np.arctan2(-vecs_from_robot[:, 1], vecs_from_robot[:, 0])
         angle_diff = angles_in_map_frame - map_yaw
         angle_diff_normalized = (angle_diff + np.pi) % (2 * np.pi) - np.pi
-        front_mask = np.abs(angle_diff_normalized) > (np.pi / 2) #prima era > e andava, forse pure meglio
+        front_mask = np.abs(angle_diff_normalized) > (np.pi / 2) # it was > before and it worked, maybe even better
         pts_front = pts[front_mask]
 
         if pts_front.shape[0] < 3:
             return 0.0
         if pts_front.shape[0] > 0:
-            # eps: distanza massima tra punti per farli appartenere allo stesso cluster
-            # min_samples: minima numerosità per cluster valido
+            # eps: maximum distance between points to be considered in the same cluster
+            # min_samples: minimum number of points for a valid cluster
             clustering = DBSCAN(eps=0.1, min_samples=3).fit(
                 pts_front)
             labels = clustering.labels_
 
-            # Filtra solo i punti che appartengono a un cluster (label != -1)
+            # Filter only points belonging to a cluster (label != -1)
             valid_mask = labels != -1
             if np.any(valid_mask):
                 labels_valid = labels[valid_mask]
                 pts_valid = pts_front[valid_mask]
 
-                # Conta quanti punti per cluster
+                # Count points per cluster
                 unique_labels, counts = np.unique(labels_valid, return_counts=True)
                 largest_cluster_label = unique_labels[np.argmax(counts)]
 
-                # Mantieni solo il cluster più grande
+                # Keep only the largest cluster
                 pts_front = pts_valid[labels_valid == largest_cluster_label]
             else:
-                # Tutti punti outlier: fallback
+                # All points are outliers: fallback
                 pts_front = np.empty((0, 2))
 
         dists_to_robot = np.linalg.norm(pts_front - robot_pt, axis=1)
@@ -624,7 +624,7 @@ class ExplorationBasedStrategy:
         for p in pts_front.astype(int):  # Itera su TUTTI i punti filtrati da front_mask
             cv.circle(debug_img, tuple(p), 4, (255, 105, 180), -1)  # Disegna in rosa (RGB)
         for p in local_pts.astype(int):
-            cv.circle(debug_img, tuple(p), 3, (0, 255, 255), -1)  # Punti gialli più piccoli
+            cv.circle(debug_img, tuple(p), 3, (0, 255, 255), -1)  # Smaller yellow points
 
         scale = 500 / debug_img.shape[1]
         debug_img_small = cv.resize(debug_img, (0, 0), fx=scale, fy=scale, interpolation=cv.INTER_AREA)
@@ -651,7 +651,7 @@ class ExplorationBasedStrategy:
 
             return False
 
-        # Distanza incrementale
+        # Incremental distance
         dx = x_odom - self.prev_pose[0]
         dy = y_odom - self.prev_pose[1]
         ds = np.hypot(dx, dy)
@@ -696,10 +696,10 @@ class ExplorationBasedStrategy:
         map_clean = cv.morphologyEx(self.map_matrix, cv.MORPH_OPEN, np.ones((3, 3), np.uint8))
         map_skel = skeletonize(map_clean > 0)
 
-        # 1. Trova i punti dello scheletro in PIXEL
+        # 1. Find the skeleton points in PIXELS
         y_idx, x_idx = np.where(map_skel == 1)
 
-        # 2. Converti ogni punto (px, py) in (world_x, world_y)
+        # 2. Convert each point (px, py) to (world_x, world_y)
         world_points = []
         for px, py in zip(x_idx, y_idx):
             wx, wy = self._map_to_world_coords(px, py)
@@ -716,44 +716,44 @@ class ExplorationBasedStrategy:
         denom = np.power(dx ** 2 + dy ** 2, 1.5) + 1e-6
         curvature = np.abs((dx * ddy - dy * ddx) / denom)
 
-        #  Smoothing della curvatura per la velcoita massima puoi usare il peso della macchina e l attrito simulato della pisat, quindi puio avere il valroe toeirco
+        # Smoothing the curvature for the maximum speed. You can use the car's weight and the track's simulated friction to get a theoretical value.
         window = 15
         curvature_smooth = np.convolve(curvature, np.ones(window) / window, mode='same')
 
-        #  Clipping: evita valori fuori scala
+        # Clipping: avoid out-of-scale values
         curvature_smooth = np.clip(curvature_smooth, 0.0, 0.5)
 
-        vmax = 5.0  # velocità massima in rettilineo
-        a_lat_max = 3.0  # accelerazione laterale massima ammessa (m/s²)
+        """vmax = 5.0  # max speed on a straight line
+        a_lat_max = 3.0  # max lateral acceleration allowed (m/s^2)
 
-        # Calcola velocità ammissibile per ogni curvatura: v = sqrt(a_lat_max / curv) e calcola sulla curvatura locale
-        # si potrebbe eliminare, ma per ora lo lascio
-        # Questa è la velocità ideale se la macchina frenasse esattamente nel punto dove la curva  inizia, quindi non va bene perch e troppo tardiva
+        # Calculate admissible speed for each curvature: v = sqrt(a_lat_max / curv) and calculate on local curvature
+        # this could be removed, but I'll leave it for now
+        # This is the ideal speed if the car brakes exactly where the curve starts, which is not good because it's too late
         with np.errstate(divide='ignore', invalid='ignore'):
             v_safe = np.sqrt(a_lat_max / np.maximum(curvature_smooth, 1e-4))
 
-        # Applica limite massimo e minimo
-        v_safe = np.clip(v_safe, 3.0, vmax)
+        # Apply max and min limits
+        v_safe = np.clip(v_safe, 3.0, vmax)"""
 
 
-        # 🔹 Lookahead smoothing: anticipa le curve di N punti e rallenta prima della curva effettiva
+        # 🔹 Lookahead smoothing: anticipate curves by N points and slow down before the actual curve
         lookahead = 200
         curvature_future = np.copy(curvature_smooth)
         for i in range(len(curvature_smooth) - lookahead):
             curvature_future[i] = np.max(curvature_smooth[i:i + lookahead])
         curvature_future[-lookahead:] = curvature_smooth[-lookahead:]
 
-        # 🔹 Ricalcola velocità in base alla curvatura futura
-        # Formula fisica: v = sqrt(mu * g / curvatura)
-        # dove mu è il coefficiente di attrito e g è l'accelerazione di gravità.
-        MU = 0.8   # Coefficiente di attrito (valore tipico per gomma su asfalto asciutto)
-        G = 9.81   # Accelerazione di gravità (m/s^2)
+        # 🔹 Recalculate speed based on future curvature
+        # Physical formula: v = sqrt(mu * g / curvature)
+        # where mu is the friction coefficient and g is the acceleration of gravity.
+        MU = 0.8   # Friction coefficient (typical value for rubber on dry asphalt)
+        G = 9.81   # Acceleration of gravity (m/s^2)
         a_lat_max = MU * G
 
         with np.errstate(divide='ignore', invalid='ignore'):
             v_safe = np.sqrt(a_lat_max / np.maximum(curvature_future, 1e-4))
 
-        # Applica limiti di velocità per sicurezza e stabilità
+        # Apply speed limits for safety and stability
         v_safe = np.clip(v_safe, 2.0, 8.0)
         velocity_profile = 0.9 * v_safe
         velocity_profile = np.convolve(velocity_profile, np.ones(10) / 10, mode='same')

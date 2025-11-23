@@ -101,7 +101,7 @@ class Visualizer:
         height, width, _ = self.canvas.shape
         crosshair = (math.floor(width / 2), math.floor(height / 2))
 
-        # Cast tutti i punti a interi
+        # Cast all points to integer
         position = (int(position[0]), int(position[1]))
         waypoint = (int(waypoint[0]), int(waypoint[1]))
         crosshair = (int(crosshair[0]), int(crosshair[1]))
@@ -139,6 +139,21 @@ class Visualizer:
         # Draw crosshair and waypoint
         cv.circle(self.canvas, crosshair, 5, colors.WHITE, 2)
         cv.circle(self.canvas, waypoint, 5, colors.WHITE, 2)
+
+        # Display the angle value
+        font = cv.FONT_HERSHEY_SIMPLEX
+        text = f"Angle: {angle:.2f} deg"
+        cv.putText(self.canvas, text, (10, 30), font, 1, colors.WHITE, 2, cv.LINE_AA)
+
+        cv.putText(
+            self.canvas,
+            f"Angle: {angle:.2f}",
+            (10, 30),
+            cv.FONT_HERSHEY_SIMPLEX,
+            1,
+            colors.WHITE,
+            2,
+        )
 
     # Show the contents of the canvas
     def show(self):

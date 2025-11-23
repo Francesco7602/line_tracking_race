@@ -35,23 +35,23 @@ def generate_launch_description():
 
     x_pos_arg = DeclareLaunchArgument(
         #"x_pos", default_value="-3.35", description="X position to spawn the robot" #per mappa base
-        #"x_pos", default_value="-5.5", description="X position to spawn the robot"  # per mappa esagono
-        "x_pos", default_value="-1.9", description="X position to spawn the robot" #per mappa a otto
+        "x_pos", default_value="-5.5", description="X position to spawn the robot"  # per mappa esagono
+        #"x_pos", default_value="-1.9", description="X position to spawn the robot" #per mappa a otto
     )
     y_pos_arg = DeclareLaunchArgument(
         #"y_pos", default_value="0.5", description="Y position to spawn the robot"#per mappa base
-        #"y_pos", default_value="0.0", description="Y position to spawn the robot"  # per mappa esagono
-        "y_pos", default_value="1.7", description="Y position to spawn the robot"#per mappa a otto
+        "y_pos", default_value="0.0", description="Y position to spawn the robot"  # per mappa esagono
+        #"y_pos", default_value="1.7", description="Y position to spawn the robot"#per mappa a otto
     )
     z_pos_arg = DeclareLaunchArgument(
         #"z_pos", default_value="0.45", description="Z position to spawn the robot"#per mappa base
-        #"z_pos", default_value="0.45", description="Z position to spawn the robot"  # per mappa esagono
-        "z_pos", default_value="0.45", description="Z position to spawn the robot"#per mappa a otto
+        "z_pos", default_value="0.45", description="Z position to spawn the robot"  # per mappa esagono
+        #"z_pos", default_value="0.45", description="Z position to spawn the robot"#per mappa a otto
     )
     yaw_arg = DeclareLaunchArgument(
         #"yaw", default_value="1.54", description="Yaw orientation to spawn the robot"#per mappa base
-        #"yaw", default_value="1.54", description="Yaw orientation to spawn the robot"  # per mappa esagono
-        "yaw", default_value="7.0", description="Yaw orientation to spawn the robot"#per mappa a otto
+        "yaw", default_value="1.54", description="Yaw orientation to spawn the robot"  # per mappa esagono
+        #"yaw", default_value="7.0", description="Yaw orientation to spawn the robot"#per mappa a otto
     )
 
     # rviz_arg = DeclareLaunchArgument(

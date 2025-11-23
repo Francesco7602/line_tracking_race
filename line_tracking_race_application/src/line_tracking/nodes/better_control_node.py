@@ -3,6 +3,7 @@ import csv
 from datetime import datetime
 import matplotlib.pyplot as plt
 import math
+import numpy as np
 
 import rclpy
 from rclpy.node import Node
@@ -54,7 +55,7 @@ class BetterControlNode(Node):
         self.k_p = 7.5
         self.k_i = 0.0
         self.k_d = 2.5
-        self.k_ff_base = 0.4# self.get_parameter("k_ff_base").get_parameter_value().double_value
+        self.k_ff_base = 0.2# self.get_parameter("k_ff_base").get_parameter_value().double_value
 
     def _setup_logging(self):
         date = datetime.today().strftime("%Y-%m-%d_%H-%M-%S")
@@ -401,19 +402,19 @@ class BetterControlNode(Node):
     def plot_error(self):
         plt.figure(figsize=(20, 10))
         if not self.times_errors or not self.errors:
-            self.get_logger().warn("Nessun dato per 'Errore di Controllo' da plottare.")
+            self.get_logger().warn("No data for 'Control Error' to plot.")
             return
         if not self.times_positional or not self.positional_errors:
-            self.get_logger().warn("Nessun dato per 'Errore di Posizione' da plottare.")
+            self.get_logger().warn("No data for 'Positional Error' to plot.")
             return
-        plt.plot(self.times_errors, self.errors, label="Errore di Controllo (per Waypoint futuro)", alpha=0.9,
-                 linewidth=2)
-        plt.plot(self.times_positional, self.positional_errors, label="Errore di Posizione (Attuale)", linestyle='--',
+        plt.plot(self.times_errors, self.errors, label="Control Error (Normalized Angular)", alpha=0.9,
+                 linewidth=2.5)
+        plt.plot(self.times_positional, self.positional_errors, label="Positional Error (m)", linestyle='--',
                  color='red',
-                 alpha=0.8, linewidth=2)
-        plt.xlabel("Tempo (s)")
-        plt.ylabel("Errore")
-        plt.title("Confronto Errori nel Tempo")
+                 alpha=0.8, linewidth=2.5)
+        plt.xlabel("Time (s)")
+        plt.ylabel("Error (m) / Normalized Angular Error (-1 to 1)")
+        plt.title("Error Comparison Over Time")
         plt.grid(True)
         plt.legend()
         try:
@@ -423,17 +424,20 @@ class BetterControlNode(Node):
             data_range = max_val - min_val
             padding = max(data_range * 0.1, 0.05)
             plt.ylim(min_val - padding, max_val + padding)
+            # Set y-axis ticks to be more granular
+            step = 0.1
+            plt.yticks(np.arange(round(min_val - padding, 1), round(max_val + padding, 1) + step, step))
         except Exception as e:
-            self.get_logger().warn(f"Impossibile calcolare i limiti Y dinamici: {e}")
+            self.get_logger().warn(f"Could not calculate dynamic Y limits: {e}")
             pass
         try:
             log_dir = os.path.join(self.pkg_path, "logs")
             os.makedirs(log_dir, exist_ok=True)
             plot_path = os.path.join(log_dir, f"error_plot_{datetime.today().strftime('%Y-%m-%d_%H-%M-%S')}.png")
             plt.savefig(plot_path)
-            self.get_logger().info(f"Grafico salvato in: {plot_path}")
+            self.get_logger().info(f"Plot saved to: {plot_path}")
         except Exception as e:
-            self.get_logger().error(f"Impossibile salvare il grafico: {e}")
+            self.get_logger().error(f"Could not save plot: {e}")
         plt.show()
 
     def stop(self):
@@ -442,8 +446,10 @@ class BetterControlNode(Node):
         twist_msg.linear.x = 0.0
         twist_msg.angular.z = 0.0
 
-        for _ in range(10):
-            self.cmd_vel.publish(twist_msg)
+        # Removed publishing loop to prevent crash during shutdown
+        # for _ in range(10):
+        #     self.cmd_vel.publish(twist_msg)
+
         self.log_performance_indices()
         self.logfile.close()
         self.evaluation_file.close()

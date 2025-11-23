@@ -47,7 +47,7 @@ class BetterCenterlineStrategy:
         self.prev_waypoint = (0, 0)
         # Publisher for the curvature topic
         self.curvature_publisher = node.create_publisher(Float32, '/planning/curvature', 10)
-        # Publisher per l'errore di posizione attuale
+        # Publisher for the current positional error
         self.positional_error_publisher = node.create_publisher(Float32, '/planning/positional_error', 10)
 
     def plan(self, img_msg):
@@ -113,17 +113,20 @@ class BetterCenterlineStrategy:
             self.viz.show()
         current_positional_error = 0.0
         if centerline.size > 0:
-            # 'position' è la posizione X,Y del robot (centro-fondo) max_ang = (ANG_SLOPE * v) + ANG_OFFSET puoi usare la curvatura che hai gia
+            # 'position' is the X,Y position of the robot (bottom-center)
             robot_x_position = position[0]
-            # Troviamo la X del punto della centerline più in basso
-            # centerline[-1] è (X, Y), quindi prendiamo l'indice 0 (la X)
-            stable_bottom_centerline_x = centerline[-1, 0]
+            robot_y_position = position[1]
+
+            # Interpolate the centerline to find the x-coordinate at the robot's y-level.
+            # This is more robust than taking the last point, which might be at a different y-level
+            # if track detection is noisy at the bottom of the image.
+            stable_bottom_centerline_x = np.interp(robot_y_position, centerline[:, 1], centerline[:, 0])
             raw_pixel_offset = robot_x_position - stable_bottom_centerline_x
-            # --- NORMALIZZAZIONE ---
+            # --- NORMALIZATION ---
             max_offset = cr_width / 2.0
             if max_offset > 0:
                 current_positional_error = raw_pixel_offset / max_offset
-                # Applichiamo un "clamp" per sicurezza
+                # Apply a "clamp" for safety
                 current_positional_error = max(-1.0, min(1.0, current_positional_error))
         pos_err_msg = Float32()
         pos_err_msg.data = float(current_positional_error)
