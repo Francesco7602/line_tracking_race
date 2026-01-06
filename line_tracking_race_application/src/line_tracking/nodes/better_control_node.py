@@ -18,8 +18,8 @@ I_MAX = 5.0            # limite integrale assoluto
 DERIV_FILTER_ALPHA = 0.95       # coefficiente filtro derivata (0..1)
 
 """
-Implementation of an advanced control node for autonomous racing.
-Provides sophisticated control algorithms with adaptive gains and
+Implementation of a control node for autonomous racing.
+Provides control algorithms with adaptive gains and
 performance monitoring capabilities.
 """
 
@@ -27,7 +27,6 @@ class BetterControlNode(Node):
     """
     Enhanced implementation of control node with advanced features:
     - Adaptive PID control
-    - Performance monitoring and logging
     - Multiple control modes support
     """
     def __init__(self):
@@ -52,9 +51,9 @@ class BetterControlNode(Node):
 
     def _get_parameters(self):
         self.max_duration = self.get_parameter("duration").get_parameter_value().double_value
-        self.k_p = 7.5
+        self.k_p = 0.09
         self.k_i = 0.0
-        self.k_d = 2.5
+        self.k_d = 0.02
         self.k_ff_base = 0.2# self.get_parameter("k_ff_base").get_parameter_value().double_value
 
     def _setup_logging(self):
@@ -99,10 +98,10 @@ class BetterControlNode(Node):
         self.current_curvature = 0.0
         self.target_velocity = None
         self.mode_sub = self.create_subscription(Float32, "/planner/mode", self.handle_mode_callback, 10)
-        self.base_gains = {"kp": 7.5, "ki": 0.0, "kd": 2.5}  # valori di riferimento
+        self.base_gains = {"kp": 0.09, "ki": 0.0, "kd": 0.02}  # valori di riferimento
         self.mode_gain_map = {
-            0.0: {"kp": 7.5, "ki": 0.0, "kd": 2.5},  # exploration
-            1.0: {"kp": 11.0, "ki": 0.0, "kd": 6.0}  # exploitation
+            0.0: {"kp": 0.09, "ki": 0.0, "kd": 0.02},  # exploration
+            1.0: {"kp": 0.12, "ki": 0.0, "kd": 0.067}  # exploitation
         }
         self.v_nominal = 2.5  # per scaling dinamico
 
@@ -151,9 +150,7 @@ class BetterControlNode(Node):
         ANG_SLOPE = 0.6  # pendenza: quanto aumenta max_ang al crescere della velocità
         ANG_OFFSET = 3.0  # offset addizionale
         MAX_ANG_LIMIT = 10.0  # limite superiore assoluto (protezione)
-        MAX_THRUST = getattr(self, "MAX_THRUST", 10.0)
         MAX_SPEED_REDUCTION_RATIO = 0.30
-        SATURATION_WARN_RATIO = 0.95
         v = getattr(self, "thrust", None)
         if v is None:
             v = getattr(self, "target_velocity", 0.0)
@@ -189,7 +186,7 @@ class BetterControlNode(Node):
             "max_ang": max_ang,
             "turn_aggressiveness": turn_aggressiveness
         }
-        self.get_logger().info(f"Control loop: {debug_line}")
+        #self.get_logger().info(f"Control loop: {debug_line}")
     def handle_error_callback(self, msg):
         """
         Process new error measurements for control computation.
@@ -240,11 +237,7 @@ class BetterControlNode(Node):
         control_output = self._calculate_pid_control(combined_error, dt)
         self.prev_error = combined_error
         self.time_prev = time_now
-
-        # Add the secondary correction based on the current positional error
-        if hasattr(self, 'current_positional_error'):
-            positional_correction = self.k_p_positional * self.current_positional_error
-            control_output += positional_correction
+        #se dovesse rompersi, probaiblmente centra quello che ho modificato qa
 
         # Aggiorna thrust
         self._update_thrust()
@@ -292,15 +285,9 @@ class BetterControlNode(Node):
         raw_d = (error - self.prev_error) / dt
         d_filtered = DERIV_FILTER_ALPHA * self.d_prev + (1.0 - DERIV_FILTER_ALPHA) * raw_d
         predicted_error = error
-        v = self.thrust if self.thrust > 0.5 else 0.5
-        V_NOMINAL = 2.5
-        if v > V_NOMINAL:
-            scale = V_NOMINAL / v #forse qua ha senso metterlo ad 1...
-        else:
-            scale = 1.0
-        p_term = self.k_p * scale * predicted_error
-        i_term = self.k_i * scale * self.accumulated_integral
-        d_term = self.k_d * scale * d_filtered
+        p_term = self.k_p  * predicted_error
+        i_term = self.k_i  * self.accumulated_integral
+        d_term = self.k_d  * d_filtered
         control_output = p_term + i_term + d_term
         v = self.thrust if self.thrust is not None else 0.0
         v = max(0.0, float(v))
@@ -330,11 +317,11 @@ class BetterControlNode(Node):
         control_output += curvature_ff
         try:
             elapsed = (self.get_clock().now() - self.time_start).nanoseconds / 1e9
-            self.log_data(
+            """self.log_data(
                 elapsed, dt, error, control_output,
                 self.thrust, control_output,
                 p_term, i_term, d_term
-            )
+            )"""
         except Exception:
             pass
 
@@ -400,36 +387,36 @@ class BetterControlNode(Node):
         self.performance_index_writer.writerow([self.ISE])
 
     def plot_error(self):
-        plt.figure(figsize=(20, 10))
-        if not self.times_errors or not self.errors:
+        plt.rcParams.update({'font.size': 14}) # Increase font size
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(20, 12), sharex=True)
+        fig.suptitle("Error Comparison Over Time", fontsize=18)
+
+        # Plot 1: Control Error
+        if self.times_errors and self.errors:
+            ax1.plot(self.times_errors, self.errors, label="Control Error (Angular)", alpha=0.9,
+                     linewidth=3.5, color='blue')
+            ax1.set_ylabel("Angular Error")
+            ax1.grid(True)
+            ax1.legend()
+        else:
+            ax1.text(0.5, 0.5, "No Control Error data to display", ha='center', va='center')
             self.get_logger().warn("No data for 'Control Error' to plot.")
-            return
-        if not self.times_positional or not self.positional_errors:
+
+        # Plot 2: Positional Error
+        if self.times_positional and self.positional_errors:
+            ax2.plot(self.times_positional, self.positional_errors, label="Positional Error (m)", linestyle='--',
+                     color='red', alpha=0.8, linewidth=3.5)
+            ax2.set_xlabel("Time (s)")
+            ax2.set_ylabel("Positional Error")
+            ax2.grid(True)
+            ax2.legend()
+        else:
+            ax2.text(0.5, 0.5, "No Positional Error data to display", ha='center', va='center')
             self.get_logger().warn("No data for 'Positional Error' to plot.")
-            return
-        plt.plot(self.times_errors, self.errors, label="Control Error (Normalized Angular)", alpha=0.9,
-                 linewidth=2.5)
-        plt.plot(self.times_positional, self.positional_errors, label="Positional Error (m)", linestyle='--',
-                 color='red',
-                 alpha=0.8, linewidth=2.5)
-        plt.xlabel("Time (s)")
-        plt.ylabel("Error (m) / Normalized Angular Error (-1 to 1)")
-        plt.title("Error Comparison Over Time")
-        plt.grid(True)
-        plt.legend()
-        try:
-            all_errors = self.errors + self.positional_errors
-            min_val = min(all_errors)
-            max_val = max(all_errors)
-            data_range = max_val - min_val
-            padding = max(data_range * 0.1, 0.05)
-            plt.ylim(min_val - padding, max_val + padding)
-            # Set y-axis ticks to be more granular
-            step = 0.1
-            plt.yticks(np.arange(round(min_val - padding, 1), round(max_val + padding, 1) + step, step))
-        except Exception as e:
-            self.get_logger().warn(f"Could not calculate dynamic Y limits: {e}")
-            pass
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+
         try:
             log_dir = os.path.join(self.pkg_path, "logs")
             os.makedirs(log_dir, exist_ok=True)
@@ -438,18 +425,13 @@ class BetterControlNode(Node):
             self.get_logger().info(f"Plot saved to: {plot_path}")
         except Exception as e:
             self.get_logger().error(f"Could not save plot: {e}")
-        plt.show()
+        # plt.show()
 
     def stop(self):
         self.get_logger().info("Stopping robot...")
         twist_msg = Twist()
         twist_msg.linear.x = 0.0
         twist_msg.angular.z = 0.0
-
-        # Removed publishing loop to prevent crash during shutdown
-        # for _ in range(10):
-        #     self.cmd_vel.publish(twist_msg)
-
         self.log_performance_indices()
         self.logfile.close()
         self.evaluation_file.close()

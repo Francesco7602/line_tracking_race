@@ -55,9 +55,8 @@ class ExplorationBasedStrategy:
 
         self.exploration_mode = True
         self.map_resolution = 0.02  # meters per pixel
-        self.map_size_meters = 75.0  # 50x50 m total map area
+        self.map_size_meters = 75.0  # 75x75 m total map area
         self.map_size_pixels = int(self.map_size_meters / self.map_resolution)
-        #        camea info nei topic, matrice di calibrazione, mappa il piano immagin in punti 3d e puo usare quelli
         # 2D map: initially all zeros
         self.map_matrix = np.zeros((self.map_size_pixels, self.map_size_pixels), dtype=np.uint8)
         self.map_origin_world = (0.0, 0.0)
@@ -119,13 +118,18 @@ class ExplorationBasedStrategy:
         # Camera intrinsics from CameraInfo message
         width = camera_info.width
         height = camera_info.height
-        K = np.array(camera_info.k).reshape((3, 3))
-        fx = K[0, 0] # Focal length in x-direction
+        K = np.array(camera_info.k).reshape((3, 3)) #reshape, same content only from vector to matrix
+        #They are two numbers that describe how much the camera ‘magnifies’ the image along the x and y axes.
+        fx = K[0, 0] # Focal length in x-direction, tell you how strongly the camera scales (magnifies) the scene along the x- and y-axes.
         fy = K[1, 1] # Focal length in y-direction
-        cx = K[0, 2] # Principal point x-coordinate
+        #These are the coordinates of the point where the optical axis strikes the sensor.
+        #In an ideal world, this point would lie exactly at the center of the image.
+        #In the real world, it almost never does.
+        #They indicate the geometric origin of the projection, that is, the pixel corresponding to the optical center.
+        cx = K[0, 2] # Principal point x-coordinate, they represent the real center of your camera, and it almost never matches the geometric center of the image.
         cy = K[1, 2] # Principal point y-coordinate
         self.node.get_logger().info(f"DEBUG: Camera intrinsics: w={width}, h={height}, fx={fx}, fy={fy}, cx={cx}, cy={cy}")
-
+        #create the soruce point
         def project_to_image(x, y, z=0):
             """
             Projects a 3D point from the robot's base_link frame (world frame for this context)
@@ -142,12 +146,12 @@ class ExplorationBasedStrategy:
                       is behind the camera or outside image bounds.
             """
             self.node.get_logger().info(f"DEBUG project_to_image: world point in = ({x}, {y}, {z})")
-            p_world = np.array([x, y, z]) # Point in base_link frame
+            p_world = np.array([x, y, z]) # Point in base_link frame (robot’s base_link), point’s absolute position relative to the robot.
 
             # Camera position relative to base_link frame
-            cam_pos_world = np.array([0.2, 0, h]) # X=0.2m forward, Y=0, Z=h (camera height)
+            cam_pos_world = np.array([0.2, 0, h]) # X=0.2m forward, Y=0, Z=h (camera height), projection requires the point’s position relative to the camera, not relative to the robot
             
-            # Vector from camera origin to the 3D point, expressed in base_link frame
+            # Vector from camera origin to the 3D point, expressed in base_link frame, so is the point position with respect to the camera and not the robot
             p_rel_cam = p_world - cam_pos_world
             self.node.get_logger().info(f"DEBUG project_to_image: p_rel_cam = {p_rel_cam}")
 
@@ -160,13 +164,14 @@ class ExplorationBasedStrategy:
                 [-math.sin(-pitch), 0, math.cos(-pitch)]
             ])
             
-            # Transform the point into the camera_link frame
+            # Transform the point into the camera_link frame applying the rotation, those are point’s coordinates in camera_link frame
             p_cam_link = R_world_to_cam_link @ p_rel_cam
             self.node.get_logger().info(f"DEBUG project_to_image: p_cam_link = {p_cam_link}")
             
-            # Rotation matrix from camera_link frame to camera_optical frame
+            # Rotation matrix from camera_link frame to camera_optical frame for opencv
+            #ROS and OpenCV use different camera axes
             # This is a standard ROS transformation:
-            # camera_link (X-fwd, Y-left, Z-up) -> camera_optical (X-right, Y-down, Z-fwd)
+            # camera_link (ROS)(X-fwd, Y-left, Z-up) -> camera_optical (OpenCV)(X-right, Y-down, Z-fwd)
             R_cam_link_to_opt = np.array([
                 [0, -1, 0],
                 [0, 0, -1],
@@ -180,12 +185,10 @@ class ExplorationBasedStrategy:
             if p_cam_optical[2] <= 0:
                 self.node.get_logger().error(f"DEBUG project_to_image: Point is behind camera (z <= 0).")
                 return None
-                
-            # Pinhole camera projection model
-            # u = fx * (X_optical / Z_optical) + cx
-            # v = fy * (Y_optical / Z_optical) + cy
-            u = fx * p_cam_optical[0] / p_cam_optical[2] + cx
-            v = fy * p_cam_optical[1] / p_cam_optical[2] + cy
+            #use pinhole model (is a standard model) for the result
+            #This calculates exactly how the 3D point maps to pixel coordinates.
+            u = fx * p_cam_optical[0] / p_cam_optical[2] + cx #x
+            v = fy * p_cam_optical[1] / p_cam_optical[2] + cy #y
             self.node.get_logger().info(f"DEBUG project_to_image: projected (u,v) = ({u}, {v})")
             
             # Check if the projected point is within the image bounds
@@ -193,11 +196,12 @@ class ExplorationBasedStrategy:
                 self.node.get_logger().error(f"DEBUG project_to_image: Point is outside image bounds.")
                 return None
 
-            return [u, v]
+            return [u, v] #(camera image plane)
 
         # Define a rectangle in the world frame (ground plane) that we expect to see in the camera image.
         # The points are [X, Y] coordinates in meters, relative to the robot's base_link.
         # X is forward, Y is left.
+        #i can change the value, but not all the value works
         world_rect = np.float32([
             [1.0,  0.4],  # Top-left in world, will be upper-left in image
             [1.0, -0.4],  # Top-right in world, will be upper-right in image
@@ -316,8 +320,6 @@ class ExplorationBasedStrategy:
         if not hasattr(self, "velocity_profile") or len(self.velocity_profile) == 0:
             self.node.get_logger().warn(
                 "[Exploitation] No velocity profile available, using local curvature estimation.")
-            current_centerline = self._estimate_current_centerline(img_msg)
-            curvature = self._predict_future_curvature(current_centerline)
         else:
             x_odom, y_odom, _ = self.current_pose
             
@@ -366,9 +368,7 @@ class ExplorationBasedStrategy:
             curvature_msg = Float32()
             curvature_msg.data = float(curvature)
             self.curvature_publisher.publish(curvature_msg)
-            self.node.get_logger().info(
-                f"[Exploitation] Pos=({x_odom:.2f},{y_odom:.2f})  -> v_target={velocity:.2f} m/s"
-            )
+            #self.node.get_logger().info(f"[Exploitation] Pos=({x_odom:.2f},{y_odom:.2f})  -> v_target={velocity:.2f} m/s")
         return float(err) if not np.isnan(err) else 0.0
 
     def _update_map(self, track_outline):
@@ -389,17 +389,17 @@ class ExplorationBasedStrategy:
         track_outline = cv.morphologyEx(track_outline, cv.MORPH_CLOSE, np.ones((5, 5), np.uint8))
         # Extract coordinates of detected track pixels
         row_indices, col_indices = np.where(track_outline == 255)
-        yellow_pixel_coords = np.column_stack((row_indices, col_indices))
+        yellow_pixel_coords = np.column_stack((row_indices, col_indices)) #array di coppie
         if yellow_pixel_coords.size == 0:
             self.node.get_logger().info("No track pixels detected.")
             return
-        yellow_pixel_coords = yellow_pixel_coords[::-1]
+        yellow_pixel_coords = yellow_pixel_coords[::-1] #inverto l'array
         #2. Transforms detected track points to world coordinates
         #2a - Convert pixel coordinates from camera to vehicle reference frame
-        points_camera = np.float32(yellow_pixel_coords[:, [1, 0]]).reshape(-1, 1, 2)
-        points_vehicle = cv.perspectiveTransform(points_camera, self.M)
+        points_camera = np.float32(yellow_pixel_coords[:, [1, 0]]).reshape(-1, 1, 2) # invert x and y, and match the input shape that OpenCV requires -> (N(number of point), 1(dummy dimnesion), 2(x and y cord))
+        points_vehicle = cv.perspectiveTransform(points_camera, self.M) #maps pixel coordinates to vehicle coordinates (base_link frame) convert in metric, real-world coordinates around the robot.
         points_vehicle_2d = points_vehicle.squeeze()
-        # Anti-outlier filter: keep only points within a logical range
+        # Anti-outlier filter: keep only points within a logical range (X between 0 and 1 meter, Y between −1 and +1 meters)
         valid_mask = (points_vehicle_2d[:, 0] >= 0.0) & (points_vehicle_2d[:, 0] <= 1.0) & \
                      (np.abs(points_vehicle_2d[:, 1]) <= 1.0)
         points_vehicle_2d = points_vehicle_2d[valid_mask]
@@ -415,9 +415,9 @@ class ExplorationBasedStrategy:
                                     [s, c]])
         # Apply rotation and translation directly to points_vehicle_2d
         points_rotated = points_vehicle_2d @ rotation_matrix.T
-        points_odom = points_rotated + np.array([x_odom, y_odom])
+        points_odom = points_rotated + np.array([x_odom, y_odom]) #You rotate by the robot's yaw and then add its global (x, y) location.
         # Sample and update points on the 2D occupancy map - 3. World → Map Coordinates
-        sampled_points_odom = points_odom[::1]
+        sampled_points_odom = points_odom[::1] #no downsampling, if i want i can make the number bigger and sample
         for (x, y) in sampled_points_odom:
             px, py = self._world_to_map_coords(x, y)
             if px is not None and py is not None:
@@ -449,25 +449,6 @@ class ExplorationBasedStrategy:
                                     self.centerline_strategy.prev_waypoint[1]]], dtype=float)
         return centerline
 
-    def _predict_future_curvature(self, current_centerline):
-        if len(self.map_points) < 3 or current_centerline is None:
-            return 0.0
-        last_x, last_y = current_centerline[-1]
-        lookahead_points = []
-        for (x, y) in self.map_points:
-            dist = math.hypot(x - last_x, y - last_y)
-            if 10 < dist < self.lookahead_distance:
-                lookahead_points.append((x, y))
-        self.lookahead_points = lookahead_points
-        pts = np.array(lookahead_points, dtype=float)
-        dx = np.gradient(pts[:, 0])
-        dy = np.gradient(pts[:, 1])
-        ddx = np.gradient(dx)
-        ddy = np.gradient(dy)
-        denominator = np.power(dx ** 2 + dy ** 2, 1.5) + 1e-6
-        curvature = np.mean(np.abs((dx * ddy - dy * ddx) / denominator))
-
-        return float(curvature)
 
     def _predict_future_curvature_exploration(self, centerline):
         """
@@ -539,9 +520,6 @@ class ExplorationBasedStrategy:
         cv.imshow("Exploration Map", debug_img_small,)
         cv.waitKey(1)
 
-    def _highlight_lookahead_points(self, current_centerline):
-        pass
-
     def _predict_future_curvature_exploitation(self):
         """
         Estimate upcoming track curvature during exploitation phase.
@@ -573,11 +551,11 @@ class ExplorationBasedStrategy:
         # Convert yaw to the image coordinate system
         map_yaw = -yaw
         # Calculate the angle of each point with respect to the robot's position
-        vecs_from_robot = pts - robot_pt
-        angles_in_map_frame = np.arctan2(-vecs_from_robot[:, 1], vecs_from_robot[:, 0])
-        angle_diff = angles_in_map_frame - map_yaw
-        angle_diff_normalized = (angle_diff + np.pi) % (2 * np.pi) - np.pi
-        front_mask = np.abs(angle_diff_normalized) > (np.pi / 2) # it was > before and it worked, maybe even better
+        vecs_from_robot = pts - robot_pt # Vectors from the robot position to each contour point, expressed in map coordinates
+        angles_in_map_frame = np.arctan2(-vecs_from_robot[:, 1], vecs_from_robot[:, 0]) # Absolute angle of each vector in the map (image) reference frame
+        angle_diff = angles_in_map_frame - map_yaw # Angular difference between each point direction and the robot heading
+        angle_diff_normalized = (angle_diff + np.pi) % (2 * np.pi) - np.pi # Normalize relative angles to the range [-pi, pi]
+        front_mask = np.abs(angle_diff_normalized) > (np.pi / 2) # Select points located in front of the robot based on relative angle
         pts_front = pts[front_mask]
 
         if pts_front.shape[0] < 3:
@@ -585,6 +563,7 @@ class ExplorationBasedStrategy:
         if pts_front.shape[0] > 0:
             # eps: maximum distance between points to be considered in the same cluster
             # min_samples: minimum number of points for a valid cluster
+            # remove outlier and isolate the road
             clustering = DBSCAN(eps=0.1, min_samples=3).fit(
                 pts_front)
             labels = clustering.labels_
@@ -595,7 +574,8 @@ class ExplorationBasedStrategy:
                 labels_valid = labels[valid_mask]
                 pts_valid = pts_front[valid_mask]
 
-                # Count points per cluster
+                # Count the number of points in each cluster and select the cluster with the most points
+                # (assumes the largest cluster corresponds to the main road contour)
                 unique_labels, counts = np.unique(labels_valid, return_counts=True)
                 largest_cluster_label = unique_labels[np.argmax(counts)]
 
@@ -722,18 +702,6 @@ class ExplorationBasedStrategy:
 
         # Clipping: avoid out-of-scale values
         curvature_smooth = np.clip(curvature_smooth, 0.0, 0.5)
-
-        """vmax = 5.0  # max speed on a straight line
-        a_lat_max = 3.0  # max lateral acceleration allowed (m/s^2)
-
-        # Calculate admissible speed for each curvature: v = sqrt(a_lat_max / curv) and calculate on local curvature
-        # this could be removed, but I'll leave it for now
-        # This is the ideal speed if the car brakes exactly where the curve starts, which is not good because it's too late
-        with np.errstate(divide='ignore', invalid='ignore'):
-            v_safe = np.sqrt(a_lat_max / np.maximum(curvature_smooth, 1e-4))
-
-        # Apply max and min limits
-        v_safe = np.clip(v_safe, 3.0, vmax)"""
 
 
         # 🔹 Lookahead smoothing: anticipate curves by N points and slow down before the actual curve

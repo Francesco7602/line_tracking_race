@@ -120,7 +120,7 @@ class BetterCenterlineStrategy:
             # Interpolate the centerline to find the x-coordinate at the robot's y-level.
             # This is more robust than taking the last point, which might be at a different y-level
             # if track detection is noisy at the bottom of the image.
-            stable_bottom_centerline_x = np.interp(robot_y_position, centerline[:, 1], centerline[:, 0])
+            stable_bottom_centerline_x = np.interp(robot_y_position, centerline[:, 1], centerline[:, 0])#centerline[:, 1] y cordinate, centerline[:, 0] x cordinate, return x for robot_y_position
             raw_pixel_offset = robot_x_position - stable_bottom_centerline_x
             # --- NORMALIZATION ---
             max_offset = cr_width / 2.0
@@ -303,9 +303,4 @@ class BetterCenterlineStrategy:
         angle = math.asin((position[0] - waypoint[0]) / dist)
         # Convert from radians to degrees
         angle_deg = angle * 180 / math.pi
-        # Normalize angle from [-90, 90] degrees to [-1, 1] range
-        # Formula: (angle + 90) / 180 * 2 - 1
-        # Simplified to: (angle + 90) / 90 - 1
-        normalized_error = (angle_deg + 90) / 90 - 1
-
-        return normalized_error, angle_deg
+        return angle_deg, angle_deg
