@@ -156,11 +156,11 @@ class BetterCenterlineStrategy:
         mask = cv.morphologyEx(mask, cv.MORPH_OPEN, kernel)
         # Find contours
         contours, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-        # Create empty binary image
+        # Create empty black binary image
         track_outline = np.zeros((height, width), dtype=np.uint8)
         if contours:
             largest_contour = max(contours, key=cv.contourArea)
-            cv.drawContours(track_outline, [largest_contour], -1, 255, thickness=-1)  # Fill
+            cv.drawContours(track_outline, [largest_contour], -1, 255, thickness=-1)  # Fill the contourn in white for cleaning again
         return track_outline
 
     def extract_track_limits(self, track_outline):

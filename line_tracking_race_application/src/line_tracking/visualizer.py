@@ -34,7 +34,7 @@ class Visualizer:
             cv.circle(self.canvas, point, 1, colors.YELLOW, 1)
 
         for point in centerline:
-            cv.circle(self.canvas, (int(point[0]), int(point[1])), 1, colors.MAGENTA, 1)
+            cv.circle(self.canvas, (int(point[0]), int(point[1])), 1, colors.MAGENTA, 1)#they are dots
             #cv.circle(self.canvas, point, 1, colors.MAGENTA, 1)
 
     # Build the background by just using the provided image

@@ -27,6 +27,10 @@ def euler_from_quaternion(x, y, z, w):
     Returns:
         tuple: (roll, pitch, yaw) in radians, though only yaw is calculated accurately
     """
+    # ROS Odometry messages provide orientation as quaternions (3D rotation).
+    # For 2D navigation on a flat track, we primarily need the 'yaw' angle (heading).
+    # This function converts the quaternion into Euler angles to extract the yaw,
+    # which is more intuitive and directly usable for 2D control logic.
     t3 = 2.0 * (w * z + x * y)
     t4 = 1.0 - 2.0 * (y * y + z * z)
     yaw = math.atan2(t3, t4)
@@ -185,8 +189,8 @@ class ExplorationBasedStrategy:
             if p_cam_optical[2] <= 0:
                 self.node.get_logger().error(f"DEBUG project_to_image: Point is behind camera (z <= 0).")
                 return None
-            #use pinhole model (is a standard model) for the result
-            #This calculates exactly how the 3D point maps to pixel coordinates.
+            # The pinhole camera model is a mathematical model that describes the relationship
+            # between the coordinates of a 3D point in the scene and its 2D projection onto the image plane.
             u = fx * p_cam_optical[0] / p_cam_optical[2] + cx #x
             v = fy * p_cam_optical[1] / p_cam_optical[2] + cy #y
             self.node.get_logger().info(f"DEBUG project_to_image: projected (u,v) = ({u}, {v})")
@@ -484,13 +488,24 @@ class ExplorationBasedStrategy:
         return float(curvature)
 
     def _world_to_map_coords(self, world_x, world_y):
+        """
+        Converts world coordinates (meters) to map coordinates (pixels).
+
+        This function translates a real-world position (e.g., robot's odometry)
+        into its corresponding pixel location on the internal occupancy grid map.
+        It accounts for the map's origin, resolution, and the inversion of the Y-axis
+        between world and image coordinate systems.
+        """
         if self.map_origin_world is None:
             self.node.get_logger().warn("map_origin_world is None!")
             return None, None
 
+        # 1. Calculate displacement from the map's world origin in meters
         delta_x = world_x - self.map_origin_world[0]
         delta_y = world_y - self.map_origin_world[1]
 
+        # 2. Convert displacement from meters to pixels and apply to map's pixel origin.
+        # Note: Y-axis is inverted (positive Y in world is often 'up', in image it's 'down').
         pixel_x = int(self.map_origin_pixels[0] + delta_x / self.map_resolution)
         pixel_y = int(self.map_origin_pixels[1] - delta_y / self.map_resolution)
 
@@ -500,6 +515,17 @@ class ExplorationBasedStrategy:
             return None, None
 
     def _map_to_world_coords(self, pixel_x, pixel_y):
+        """
+        Converts map coordinates (pixels) back to world coordinates (meters).
+
+        This function performs the inverse operation of _world_to_map_coords,
+        translating a pixel location on the internal occupancy grid map
+        into its corresponding real-world position in meters.
+        It uses the map's origin, resolution, and accounts for the Y-axis inversion.
+        """
+        # 1. Calculate displacement from the map's pixel origin in pixels
+        # 2. Convert displacement from pixels to meters and apply to map's world origin.
+        # Note: Y-axis inversion is handled consistently.
         world_x = self.map_origin_world[0] + \
                   (pixel_x - self.map_origin_pixels[0]) * self.map_resolution
         world_y = self.map_origin_world[1] - \
@@ -515,6 +541,10 @@ class ExplorationBasedStrategy:
             lx, ly = self._world_to_map_coords(x_odom, y_odom)
             if lx is not None:
                 cv.circle(display_img, (lx, ly), 3, (0, 0, 255), -1)
+        # The full map matrix is too large to display effectively
+        # on a standard monitor. It is resized to a smaller, manageable size (500 pixels wide)
+        # for debugging and visualization purposes. The actual map used for calculations
+        # retains its full resolution.
         scale = 500 / display_img.shape[1]
         debug_img_small = cv.resize(display_img, (0, 0), fx=scale, fy=scale, interpolation=cv.INTER_AREA)
         cv.imshow("Exploration Map", debug_img_small,)

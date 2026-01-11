@@ -103,7 +103,7 @@ class BetterControlNode(Node):
             0.0: {"kp": 0.09, "ki": 0.0, "kd": 0.02},  # exploration
             1.0: {"kp": 0.12, "ki": 0.0, "kd": 0.067}  # exploitation
         }
-        self.v_nominal = 2.5  # per scaling dinamico
+        self.v_nominal = 2.5  # per scaling dinamico (non serve, si può levare)
 
     def handle_mode_callback(self, msg):
         mode = float(msg.data)
@@ -177,16 +177,7 @@ class BetterControlNode(Node):
         speed_reduction_factor = 1.0 - MAX_SPEED_REDUCTION_RATIO * turn_aggressiveness
         linear_x_after = max(0.0, linear_x) * speed_reduction_factor
         self.publish_cmd_vel(linear_x_after, angular_z_saturated)
-        debug_line = {
-            "v": v,
-            "requested_linear": linear_x,
-            "linear_after": linear_x_after,
-            "requested_angular": angular_z,
-            "angular_after": angular_z_saturated,
-            "max_ang": max_ang,
-            "turn_aggressiveness": turn_aggressiveness
-        }
-        #self.get_logger().info(f"Control loop: {debug_line}")
+
     def handle_error_callback(self, msg):
         """
         Process new error measurements for control computation.

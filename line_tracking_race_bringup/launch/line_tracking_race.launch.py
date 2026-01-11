@@ -34,60 +34,26 @@ def generate_launch_description():
     )
 
     x_pos_arg = DeclareLaunchArgument(
-        #"x_pos", default_value="-3.35", description="X position to spawn the robot" #per mappa base
-        "x_pos", default_value="-5.5", description="X position to spawn the robot"  # per mappa esagono
+        "x_pos", default_value="-3.35", description="X position to spawn the robot" #per mappa base
+        #"x_pos", default_value="-5.5", description="X position to spawn the robot"  # per mappa esagono
         #"x_pos", default_value="-1.9", description="X position to spawn the robot" #per mappa a otto
     )
     y_pos_arg = DeclareLaunchArgument(
-        #"y_pos", default_value="0.5", description="Y position to spawn the robot"#per mappa base
-        "y_pos", default_value="0.0", description="Y position to spawn the robot"  # per mappa esagono
+        "y_pos", default_value="0.5", description="Y position to spawn the robot"#per mappa base
+        #"y_pos", default_value="0.0", description="Y position to spawn the robot"  # per mappa esagono
         #"y_pos", default_value="1.7", description="Y position to spawn the robot"#per mappa a otto
     )
     z_pos_arg = DeclareLaunchArgument(
-        #"z_pos", default_value="0.45", description="Z position to spawn the robot"#per mappa base
-        "z_pos", default_value="0.45", description="Z position to spawn the robot"  # per mappa esagono
+        "z_pos", default_value="0.45", description="Z position to spawn the robot"#per mappa base
+        #"z_pos", default_value="0.45", description="Z position to spawn the robot"  # per mappa esagono
         #"z_pos", default_value="0.45", description="Z position to spawn the robot"#per mappa a otto
     )
     yaw_arg = DeclareLaunchArgument(
-        #"yaw", default_value="1.54", description="Yaw orientation to spawn the robot"#per mappa base
-        "yaw", default_value="1.54", description="Yaw orientation to spawn the robot"  # per mappa esagono
+        "yaw", default_value="1.54", description="Yaw orientation to spawn the robot"#per mappa base
+        #"yaw", default_value="1.54", description="Yaw orientation to spawn the robot"  # per mappa esagono
         #"yaw", default_value="7.0", description="Yaw orientation to spawn the robot"#per mappa a otto
     )
 
-    # rviz_arg = DeclareLaunchArgument(
-    #     'rviz', default_value='true', description='Open RViz.'
-    # )
-    
-    # --------- Launch Gazebo server and ros_gz_bridge with ros_gz_sim.launch ---------
-    # https://github.com/gazebosim/ros_gz/blob/ros2/ros_gz_sim/launch/ros_gz_sim.launch.py
-    # It allows to compose the bridge and gazebo see https://gazebosim.org/docs/latest/ros2_overview/
-    # Doesn't work due to https://github.com/gazebosim/ros_gz/issues/774 ,
-    # a workaround is to launch them separately
-    #
-    # gz_sim_ros_bridge = IncludeLaunchDescription(
-    #     PythonLaunchDescriptionSource(
-    #         PathJoinSubstitution([pkg_ros_gz_sim, 'launch', 'ros_gz_sim.launch.py'])
-    #     ),
-    #     launch_arguments={
-    #         "log_level" : "info",
-    #         "use_composition" : "true",
-    #         "create_own_container" : "true",
-    #         # --- gzbridge ---
-    #         "bridge_name": "ros_gz_bridge",
-    #         "config_file": PathJoinSubstitution(
-    #             [pkg_project_bringup, "config", "ros_gz_bridge.yaml"]
-    #         ),
-    #         # --- gzserver ---
-    #         "world_sdf_file": PathJoinSubstitution([pkg_project_gazebo, 'worlds', LaunchConfiguration("world_file")])
-    #     }.items(),
-    # )
-    # # launch gazebo GUI since ros_gz_sim.launch launches only the gz server
-    # gz_gui_cmd = ExecuteProcess(
-    #     cmd=['gz', 'sim', '-g'],
-    #     output='screen',
-    #     emulate_tty=True,
-    #     name='gazebo_gui'
-    # )
 
     # launch gazebo
     gz_sim = IncludeLaunchDescription(
@@ -146,14 +112,6 @@ def generate_launch_description():
         output="screen",
     )
 
-    # Visualize in RViz
-    rviz = Node(
-       package='rviz2',
-       executable='rviz2',
-       arguments=['-d', PathJoinSubstitution([pkg_project_bringup, "config", 'line_tracking_race.rviz'])],
-       condition=IfCondition(LaunchConfiguration('rviz_arg'))
-    )
-
     return LaunchDescription(
         [
             world_file,
@@ -162,13 +120,9 @@ def generate_launch_description():
             y_pos_arg,
             z_pos_arg,
             yaw_arg,
-            # rviz_arg,
-            # gz_sim_ros_bridge,
-            # gz_gui_cmd,
             gz_sim,
             gz_bridge,
             car_urdf,
             spawn_robot_node,
-            # rviz
         ]
     )
