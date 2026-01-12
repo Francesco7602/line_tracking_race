@@ -707,6 +707,8 @@ class ExplorationBasedStrategy:
         map_skel = skeletonize(map_clean > 0)
 
         # 1. Find the skeleton points in PIXELS
+        # Note: np.where returns points in raster order (row-major), not necessarily
+        # in the topological order of the track path.
         y_idx, x_idx = np.where(map_skel == 1)
 
         # 2. Convert each point (px, py) to (world_x, world_y)
@@ -719,6 +721,22 @@ class ExplorationBasedStrategy:
         if len(pts) < 5:
             return []
 
+        # np.gradient calculates the discrete derivative using finite differences.
+        # It computes the gradient at each point using its neighbors. For interior
+        # points, it uses a central difference (e.g., (y[i+1] - y[i-1]) / 2), while
+        # for the endpoints, it uses a forward or backward difference.
+        # It computes the gradient at each point using its neighbors.
+
+        # Example Input:  y = [2,  4, 10, 14]
+        # 1. Start (Forward Difference): uses y[1] and y[0] because you have no before point, so you use the next point
+        #    Gradient[0] = (4 - 2) / 1 = 2.0
+        # 2. Interior (Central Difference): uses y[i+1] and y[i-1] (span of 2) you use the before and after point, the distance is 2 so you dive by 2
+        #    Gradient[1] = (10 - 2) / 2 = 4.0   <-- (Next - Prev) / 2
+        #    Gradient[2] = (14 - 4) / 2 = 5.0
+        # 3. End (Backward Difference): uses y[n] and y[n-1] because you have no after poit, so you use the previous point
+        #    Gradient[3] = (14 - 10) / 1 = 4.0
+        # Result: [2.0, 4.0, 5.0, 4.0]
+
         dx = np.gradient(pts[:, 0])
         dy = np.gradient(pts[:, 1])
         ddx = np.gradient(dx)
@@ -726,7 +744,14 @@ class ExplorationBasedStrategy:
         denom = np.power(dx ** 2 + dy ** 2, 1.5) + 1e-6
         curvature = np.abs((dx * ddy - dy * ddx) / denom)
 
-        # Smoothing the curvature for the maximum speed. You can use the car's weight and the track's simulated friction to get a theoretical value.
+        # Smoothing the curvature for the maximum speed.
+        # Since points from np.where are in raster order, there might be spatial jumps
+        # in the array (e.g., in closed loops). This creates artificial spikes in curvature.
+        # We handle this engineering-wise:
+        # 1. Smoothing (convolve): Averages out high-frequency noise and small discontinuities.
+        # 2. Clipping (clip): Cuts off the extreme curvature values caused by index jumps,
+        #    treating them as tight curves rather than mathematical errors.
+
         window = 15
         curvature_smooth = np.convolve(curvature, np.ones(window) / window, mode='same')
 
