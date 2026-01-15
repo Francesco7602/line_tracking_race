@@ -776,8 +776,18 @@ class ExplorationBasedStrategy:
         with np.errstate(divide='ignore', invalid='ignore'):
             v_safe = np.sqrt(a_lat_max / np.maximum(curvature_future, 1e-4))
 
-        # Apply speed limits for safety and stability
+        # Apply speed limits for safety and stability.
+        # The 'clip' function enforces a hard floor and ceiling on the velocity.
+        # - Minimum speed (2.0 m/s): Ensures the robot maintains momentum and control, preventing stalls.
+        # - Maximum speed (8.0 m/s): A hard safety cap to prevent unrealistic speeds on straight sections.
         v_safe = np.clip(v_safe, 2.0, 8.0)
+
+        # Apply a proportional safety margin.
+        # This accounts for real-world imperfections and ensures the robot operates comfortably within its physical limits.
         velocity_profile = 0.9 * v_safe
+
+        # Smooth the velocity profile using a 10-point moving average.
+        # This prevents sudden, jerky changes in target speed (i.e., high acceleration/deceleration).
+        # The result is a much smoother and more stable physical motion.
         velocity_profile = np.convolve(velocity_profile, np.ones(10) / 10, mode='same')
         return [(pts[i, 0], pts[i, 1], velocity_profile[i]) for i in range(len(pts))]

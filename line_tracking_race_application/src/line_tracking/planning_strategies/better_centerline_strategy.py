@@ -300,7 +300,12 @@ class BetterCenterlineStrategy:
         )
         # Calculate angle using arcsine (horizontal displacement / total distance)
         # This gives the angle from the vertical (forward direction)
+        # NOTE: math.asin returns a raw float in RADIANS (e.g., 0.52), not degrees.
         angle = math.asin((position[0] - waypoint[0]) / dist)
+
         # Convert from radians to degrees
+        # Degrees = Radians * (180 / PI).
+        # Example: 0.52 rad becomes ~30.0 degrees.
+        #max 90 -90
         angle_deg = angle * 180 / math.pi
         return angle_deg, angle_deg

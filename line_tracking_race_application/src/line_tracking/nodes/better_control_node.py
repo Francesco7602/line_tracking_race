@@ -274,6 +274,22 @@ class BetterControlNode(Node):
             self.accumulated_integral += 0.5 * (error + self.prev_error) * dt
         self.accumulated_integral = max(-I_MAX, min(I_MAX, self.accumulated_integral))
         raw_d = (error - self.prev_error) / dt
+        # The raw derivative (raw_d) can be very noisy due to sensor fluctuations or minor
+        # measurement errors. A noisy derivative can lead to jerky and unstable control
+        # actions. To mitigate this, a low-pass filter is applied to the derivative term.
+        #
+        # Example: Consider a sequence of errors: [0.1, 0.09, 0.1] with dt=1.
+        # - If prev_error = 0.1, current error = 0.09: raw_d = (0.09 - 0.1) / 1 = -0.01
+        # - If prev_error = 0.09, current error = 0.1: raw_d = (0.1 - 0.09) / 1 = 0.01
+        #
+        # Without filtering, the derivative term would oscillate rapidly between -0.01 and 0.01.
+        # With DERIV_FILTER_ALPHA = 0.95 (a common value for smoothing):
+        # - d_filtered = 0.95 * d_prev + 0.05 * raw_d
+        #   If d_prev was 0, and raw_d = -0.01, then d_filtered = 0.95 * 0 + 0.05 * (-0.01) = -0.0005
+        #   If d_prev was -0.0005, and raw_d = 0.01, then d_filtered = 0.95 * (-0.0005) + 0.05 * (0.01) = -0.000475 + 0.0005 = 0.000025
+        #
+        # As seen, the filtered derivative (d_filtered) changes much more smoothly,
+        # providing a more stable input to the PID controller and preventing overreactions.
         d_filtered = DERIV_FILTER_ALPHA * self.d_prev + (1.0 - DERIV_FILTER_ALPHA) * raw_d
         predicted_error = error
         p_term = self.k_p  * predicted_error
